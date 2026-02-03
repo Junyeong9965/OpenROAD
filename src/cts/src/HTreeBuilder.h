@@ -33,7 +33,9 @@ class SegmentBuilder
                  ClockSubNet& drivingSubNet,
                  const TechChar& techChar,
                  unsigned techCharDistUnit,
-                 TreeBuilder* tree);
+                 TreeBuilder* tree,
+                 odb::dbDatabase* db,
+                 int targetTier);
 
   void build(const std::string& forceBuffer = "");
   void forceBufferInSegment(const std::string& master);
@@ -53,6 +55,8 @@ class SegmentBuilder
   Clock* clock_;
   ClockSubNet* drivingSubNet_;
   TreeBuilder* tree_;
+  odb::dbDatabase* db_;
+  int targetTier_ = -1;
   unsigned numBufferLevels_ = 0;
 };
 
@@ -371,6 +375,10 @@ class HTreeBuilder : public TreeBuilder
   std::vector<unsigned> clusterSizes() const { return clusterSizes_; }
   Point<double> resolveLocationCollision(
       const Point<double>& legalCenter) const;
+  int getDominantTierFromInsts(const std::vector<ClockInst*>& insts) const;
+  int getDominantTierFromSinkLocs(
+      const std::vector<Point<double>>& sinkLocs) const;
+  int getDominantTierFromClockSinks() const;
 
  private:
   Box<double> sinkRegion_;

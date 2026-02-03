@@ -148,6 +148,15 @@ void definComponent::begin(const char* iname, const char* mname)
     if (_cur_inst != nullptr) {
       _inst_cnt++;
       _iterm_cnt += master->getMTermCount();
+
+      // Auto-detect tier from master name suffix (_upper or _bottom)
+      size_t len = strlen(mname);
+      if (len >= 6 && strcmp(mname + len - 6, "_upper") == 0) {
+        _cur_inst->setTier(1);
+      } else if (len >= 7 && strcmp(mname + len - 7, "_bottom") == 0) {
+        _cur_inst->setTier(0);
+      }
+      // Default tier is 0 (set in dbInst constructor)
     } else {
       _logger->warn(
           utl::ODB, 93, "error: duplicate instance definition({})", iname);

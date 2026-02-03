@@ -25,6 +25,53 @@ namespace cts {
 
 using utl::CTS;
 
+namespace {
+bool hasSuffix(const std::string& name, const std::string& suffix)
+{
+  if (name.size() < suffix.size()) {
+    return false;
+  }
+  return name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string mapBufferMasterToTier(const std::string& master,
+                                  int target_tier,
+                                  odb::dbDatabase* db)
+{
+  if (target_tier != 0 && target_tier != 1) {
+    return master;
+  }
+  if (db == nullptr || master.empty()) {
+    return master;
+  }
+
+  std::string candidate = master;
+  if (target_tier == 1) {
+    if (hasSuffix(master, "_bottom")) {
+      candidate = master.substr(0, master.size() - 7) + "_upper";
+    } else if (!hasSuffix(master, "_upper")) {
+      candidate = master + "_upper";
+    }
+  } else {
+    if (hasSuffix(master, "_upper")) {
+      candidate = master.substr(0, master.size() - 6) + "_bottom";
+    } else if (!hasSuffix(master, "_bottom")) {
+      candidate = master + "_bottom";
+    }
+  }
+
+  if (candidate == master) {
+    return master;
+  }
+
+  if (db->findMaster(candidate.c_str()) != nullptr) {
+    return candidate;
+  }
+
+  return master;
+}
+}  // namespace
+
 Point<double> HTreeBuilder::legalizeOneBuffer(Point<double> bufferLoc,
                                               const std::string& bufferName)
 {
@@ -201,16 +248,18 @@ void HTreeBuilder::preSinkClustering(
           = (xSum / (float) pointCounter);  // geometric center of cluster
       const float normCenterY = (ySum / (float) pointCounter);
       Point<double> center((double) normCenterX, (double) normCenterY);
-      Point<double> rootBufLoc
-          = legalizeOneBuffer(center, options_->getSinkBuffer());
+      const int target_tier = getDominantTierFromInsts(clusterClockInsts);
+      const std::string sink_buffer
+          = mapBufferMasterToTier(options_->getSinkBuffer(), target_tier, db_);
+      Point<double> rootBufLoc = legalizeOneBuffer(center, sink_buffer);
       commitMoveLoc(center, rootBufLoc);
 
       const char* baseName = secondLevel ? "clkbuf_leaf2_" : "clkbuf_leaf_";
-      ClockInst& rootBuffer
-          = clock_.addClockBuffer(baseName + std::to_string(clusterCount),
-                                  options_->getSinkBuffer(),
-                                  rootBufLoc.getX() * wireSegmentUnit_,
-                                  rootBufLoc.getY() * wireSegmentUnit_);
+      ClockInst& rootBuffer = clock_.addClockBuffer(
+          baseName + std::to_string(clusterCount),
+          sink_buffer,
+          rootBufLoc.getX() * wireSegmentUnit_,
+          rootBufLoc.getY() * wireSegmentUnit_);
       if (center != rootBufLoc) {
         debugPrint(logger_,
                    CTS,
@@ -296,6 +345,85 @@ Point<double> HTreeBuilder::resolveLocationCollision(
         resolvedLocation.getY());
   }
   return resolvedLocation;
+}
+
+int HTreeBuilder::getDominantTierFromInsts(
+    const std::vector<ClockInst*>& insts) const
+{
+  int tier0 = 0;
+  int tier1 = 0;
+  for (const ClockInst* inst : insts) {
+    if (inst == nullptr) {
+      continue;
+    }
+    odb::dbInst* db_inst = inst->getDbInst();
+    if (db_inst == nullptr) {
+      continue;
+    }
+    const int tier = db_inst->getTier();
+    if (tier == 0) {
+      tier0++;
+    } else if (tier == 1) {
+      tier1++;
+    }
+  }
+  if (tier0 == 0 && tier1 == 0) {
+    return -1;
+  }
+  return (tier1 > tier0) ? 1 : 0;
+}
+
+int HTreeBuilder::getDominantTierFromSinkLocs(
+    const std::vector<Point<double>>& sinkLocs) const
+{
+  int tier0 = 0;
+  int tier1 = 0;
+  for (const Point<double>& loc : sinkLocs) {
+    auto it = mapLocationToSink_.find(loc);
+    if (it == mapLocationToSink_.end()) {
+      continue;
+    }
+    ClockInst* inst = it->second;
+    if (inst == nullptr) {
+      continue;
+    }
+    odb::dbInst* db_inst = inst->getDbInst();
+    if (db_inst == nullptr) {
+      continue;
+    }
+    const int tier = db_inst->getTier();
+    if (tier == 0) {
+      tier0++;
+    } else if (tier == 1) {
+      tier1++;
+    }
+  }
+  if (tier0 == 0 && tier1 == 0) {
+    return -1;
+  }
+  return (tier1 > tier0) ? 1 : 0;
+}
+
+int HTreeBuilder::getDominantTierFromClockSinks() const
+{
+  int tier0 = 0;
+  int tier1 = 0;
+  clock_.forEachSink([&](const ClockInst& inst) {
+    odb::dbInst* db_inst = inst.getDbInst();
+    if (db_inst == nullptr) {
+      return;
+    }
+    const int tier = db_inst->getTier();
+    if (tier == 0) {
+      tier0++;
+    } else if (tier == 1) {
+      tier1++;
+    }
+  });
+  if (tier0 == 0 && tier1 == 0) {
+    return -1;
+  }
+  return (tier1 > tier0) ? 1 : 0;
 }
 
 void HTreeBuilder::initSinkRegion()
@@ -1930,15 +2058,17 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
 void HTreeBuilder::createClockSubNets()
 {
   Point<double> center = sinkRegion_.getCenter();
-  Point<double> legalCenter
-      = legalizeOneBuffer(center, options_->getRootBuffer());
+  const int root_tier = getDominantTierFromClockSinks();
+  const std::string root_buffer
+      = mapBufferMasterToTier(options_->getRootBuffer(), root_tier, db_);
+  Point<double> legalCenter = legalizeOneBuffer(center, root_buffer);
   sinkRegion_.setCenter(legalCenter);
   commitMoveLoc(center, legalCenter);
   const int centerX = legalCenter.getX() * wireSegmentUnit_;
   const int centerY = legalCenter.getY() * wireSegmentUnit_;
 
-  ClockInst& rootBuffer = clock_.addClockBuffer(
-      "clkbuf_0", options_->getRootBuffer(), centerX, centerY);
+  ClockInst& rootBuffer
+      = clock_.addClockBuffer("clkbuf_0", root_buffer, centerX, centerY);
 
   if (topBufferName_.empty()) {
     topBufferName_ = rootBuffer.getName();
@@ -1970,8 +2100,12 @@ void HTreeBuilder::createClockSubNets()
     if (topLevelTopology.getBranchSinksLocations(idx).empty()) {
       return;
     }
+    const int branch_tier = getDominantTierFromSinkLocs(
+        topLevelTopology.getBranchSinksLocations(idx));
+    const std::string branch_root_buffer = mapBufferMasterToTier(
+        options_->getRootBuffer(), branch_tier, db_);
     Point<double> legalBranchPoint
-        = legalizeOneBuffer(branchPoint, options_->getRootBuffer());
+        = legalizeOneBuffer(branchPoint, branch_root_buffer);
     commitMoveLoc(branchPoint, legalBranchPoint);
 
     // clang-format off
@@ -1996,14 +2130,18 @@ void HTreeBuilder::createClockSubNets()
                            rootClockSubNet,
                            *techChar_,
                            wireSegmentUnit_,
-                           this);
+                           this,
+                           db_,
+                           branch_tier);
     if (!options_->getTreeBuffer().empty()) {
-      builder.build(options_->getTreeBuffer());
+      const std::string tree_buffer = mapBufferMasterToTier(
+          options_->getTreeBuffer(), branch_tier, db_);
+      builder.build(tree_buffer);
     } else {
       builder.build();
     }
     if (topologyForEachLevel_.size() == 1) {
-      builder.forceBufferInSegment(options_->getRootBuffer());
+      builder.forceBufferInSegment(branch_root_buffer);
     }
     if (isFirstPoint) {
       treeBufLevels_ += builder.getNumBufferLevels();
@@ -2027,8 +2165,12 @@ void HTreeBuilder::createClockSubNets()
       LevelTopology& parentTopology = topologyForEachLevel_[levelIdx - 1];
       Point<double> parentPoint = parentTopology.getBranchingPoint(parentIdx);
 
+      const int branch_tier
+          = getDominantTierFromSinkLocs(topology.getBranchSinksLocations(idx));
+      const std::string branch_root_buffer = mapBufferMasterToTier(
+          options_->getRootBuffer(), branch_tier, db_);
       Point<double> legalBranchPoint
-          = legalizeOneBuffer(branchPoint, options_->getRootBuffer());
+          = legalizeOneBuffer(branchPoint, branch_root_buffer);
       commitMoveLoc(branchPoint, legalBranchPoint);
 
       // clang-format off
@@ -2056,7 +2198,9 @@ void HTreeBuilder::createClockSubNets()
                              *parentTopology.getBranchDrivingSubNet(parentIdx),
                              *techChar_,
                              wireSegmentUnit_,
-                             this);
+                             this,
+                             db_,
+                             branch_tier);
 
       // Set clock tree level the first time only.
       if (builder.getDrivingSubNet()->getTreeLevel() < 0) {
@@ -2064,12 +2208,14 @@ void HTreeBuilder::createClockSubNets()
       }
 
       if (!options_->getTreeBuffer().empty()) {
-        builder.build(options_->getTreeBuffer());
+        const std::string tree_buffer = mapBufferMasterToTier(
+            options_->getTreeBuffer(), branch_tier, db_);
+        builder.build(tree_buffer);
       } else {
         builder.build();
       }
       if (levelIdx == topologyForEachLevel_.size() - 1) {
-        builder.forceBufferInSegment(options_->getRootBuffer());
+        builder.forceBufferInSegment(branch_root_buffer);
       }
       if (isFirstPoint) {
         treeBufLevels_ += builder.getNumBufferLevels();
@@ -2242,7 +2388,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
                                ClockSubNet& drivingSubNet,
                                const TechChar& techChar,
                                const unsigned techCharDistUnit,
-                               TreeBuilder* tree)
+                               TreeBuilder* tree,
+                               odb::dbDatabase* db,
+                               int targetTier)
     : instPrefix_(instPrefix),
       netPrefix_(netPrefix),
       root_(root),
@@ -2252,7 +2400,9 @@ SegmentBuilder::SegmentBuilder(const std::string& instPrefix,
       techCharDistUnit_(techCharDistUnit),
       clock_(&clock),
       drivingSubNet_(&drivingSubNet),
-      tree_(tree)
+      tree_(tree),
+      db_(db),
+      targetTier_(targetTier)
 {
 }
 
@@ -2286,13 +2436,15 @@ void SegmentBuilder::build(const std::string& forceBuffer)
       const std::string buffMaster = !forceBuffer.empty()
                                          ? forceBuffer
                                          : wireSegment.getBufferMaster(buffer);
+      const std::string tieredMaster
+          = mapBufferMasterToTier(buffMaster, targetTier_, db_);
       Point<double> bufferLoc(x, y);
       Point<double> legalBufferLoc
-          = tree_->legalizeOneBuffer(bufferLoc, buffMaster);
+          = tree_->legalizeOneBuffer(bufferLoc, tieredMaster);
       tree_->commitMoveLoc(bufferLoc, legalBufferLoc);
       ClockInst& newBuffer = clock_->addClockBuffer(
           instPrefix_ + std::to_string(numBufferLevels_),
-          buffMaster,
+          tieredMaster,
           legalBufferLoc.getX() * techCharDistUnit_,
           legalBufferLoc.getY() * techCharDistUnit_);
 
@@ -2332,9 +2484,11 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
     return;
   }
 
+  const std::string tieredMaster
+      = mapBufferMasterToTier(master, targetTier_, db_);
   ClockInst& newBuffer
       = clock_->addClockBuffer(instPrefix_ + "_f",
-                               master,
+                               tieredMaster,
                                target_.getX() * techCharDistUnit_,
                                target_.getY() * techCharDistUnit_);
   tree_->addTreeLevelBuffer(&newBuffer);

@@ -498,4 +498,10 @@ reset_wire_segment_distance_unit()
 {
   getTritonCts()->getParms()->resetWireSegmentUnit();
 }
+
+void
+extract_ff_timing_graph_verilog(const char* verilog_file, const char* output_file)
+{
+  getTritonCts()->extractFFGraphFromVerilog(verilog_file, output_file);
+}
 %} //inline

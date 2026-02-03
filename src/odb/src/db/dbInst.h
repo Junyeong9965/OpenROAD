@@ -65,6 +65,7 @@ class _dbInst : public _dbObject
   char* name_;
   int x_;
   int y_;
+  int z_;  // 3D tier coordinate (0=bottom, 1=upper, etc.)
   int weight_;
   dbId<_dbInst> next_entry_;
   dbId<_dbInstHdr> inst_hdr_;

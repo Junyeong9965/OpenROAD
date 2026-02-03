@@ -2788,6 +2788,18 @@ class dbInst : public dbObject
   void setOrigin(int x, int y);
 
   ///
+  /// Get the tier (z coordinate) of this instance for 3D IC.
+  /// 0 = bottom tier, 1 = upper tier, etc.
+  ///
+  int getTier() const;
+
+  ///
+  /// Set the tier (z coordinate) of this instance for 3D IC.
+  /// 0 = bottom tier, 1 = upper tier, etc.
+  ///
+  void setTier(int tier);
+
+  ///
   /// Get the orientation of this instance.
   ///
   dbOrientType getOrient();

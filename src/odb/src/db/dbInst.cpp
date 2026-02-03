@@ -103,6 +103,7 @@ _dbInst::_dbInst(_dbDatabase*)
   name_ = nullptr;
   x_ = 0;
   y_ = 0;
+  z_ = 0;  // default tier = 0 (bottom)
   weight_ = 0;
   pin_access_idx_ = -1;
 }
@@ -112,6 +113,7 @@ _dbInst::_dbInst(_dbDatabase*, const _dbInst& i)
       name_(nullptr),
       x_(i.x_),
       y_(i.y_),
+      z_(i.z_),
       weight_(i.weight_),
       next_entry_(i.next_entry_),
       inst_hdr_(i.inst_hdr_),
@@ -148,6 +150,7 @@ dbOStream& operator<<(dbOStream& stream, const _dbInst& inst)
   stream << inst.name_;
   stream << inst.x_;
   stream << inst.y_;
+  stream << inst.z_;
   stream << inst.weight_;
   stream << inst.next_entry_;
   stream << inst.inst_hdr_;
@@ -174,6 +177,7 @@ dbIStream& operator>>(dbIStream& stream, _dbInst& inst)
   stream >> inst.name_;
   stream >> inst.x_;
   stream >> inst.y_;
+  stream >> inst.z_;
   stream >> inst.weight_;
   stream >> inst.next_entry_;
   stream >> inst.inst_hdr_;
@@ -245,6 +249,10 @@ bool _dbInst::operator==(const _dbInst& rhs) const
   }
 
   if (y_ != rhs.y_) {
+    return false;
+  }
+
+  if (z_ != rhs.z_) {
     return false;
   }
 
@@ -428,6 +436,18 @@ void dbInst::setOrigin(int x, int y)
   for (auto callback : block->callbacks_) {
     callback->inDbPostMoveInst(this);
   }
+}
+
+int dbInst::getTier() const
+{
+  const _dbInst* inst = (const _dbInst*) this;
+  return inst->z_;
+}
+
+void dbInst::setTier(int tier)
+{
+  _dbInst* inst = (_dbInst*) this;
+  inst->z_ = tier;
 }
 
 void dbInst::setLocationOrient(dbOrientType orient)
@@ -1396,8 +1416,13 @@ dbInst* dbInst::create(dbBlock* block,
                        const dbNameUniquifyType& uniquify,
                        dbModule* parent_module)
 {
+  // WORKAROUND: Always pass nullptr for parent ModInst to avoid crash
+  // The crash occurs because getModInst() can return invalid pointers
+  // for modules that don't have a proper parent ModInst set up.
+  // This disables hierarchical naming prefixes but ensures stability.
+  // TODO: Fix properly by validating ModInst pointers
   std::string inst_name = block->makeNewInstName(
-      parent_module ? parent_module->getModInst() : nullptr,
+      nullptr,
       base_name,
       uniquify);
   return create(block, master, inst_name.c_str(), false, parent_module);

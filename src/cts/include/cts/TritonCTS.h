@@ -66,6 +66,10 @@ class TritonCTS
   void runTritonCts();
   void reportCtsMetrics();
   CtsOptions* getParms() { return options_; }
+
+  // FF-to-FF timing graph extraction for 3D-CTS (Verilog-based with tier info)
+  void extractFFGraphFromVerilog(const std::string& verilog_file,
+                                  const std::string& output_file);
   TechChar* getCharacterization() { return techChar_.get(); }
   odb::dbBlock* getBlock() { return db_->getChip()->getBlock(); }
   int setClockNets(const char* names);

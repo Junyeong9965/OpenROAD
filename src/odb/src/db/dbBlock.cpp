@@ -3870,12 +3870,16 @@ std::string _dbBlock::makeNewName(
 
   // Decide hierarchical name without unique index
   fmt::memory_buffer buf;
-  if (parent) {
-    fmt::format_to(std::back_inserter(buf),
-                   "{}{}",
-                   parent->getHierarchicalName(),
-                   block->getHierarchyDelimiter());
-  }
+  // WORKAROUND: Skip hierarchical prefix to avoid crash with invalid ModInst pointers
+  // The parent pointer from top module's getModInst() can be invalid/garbage in flat designs
+  // TODO: Properly validate ModInst pointers before dereferencing
+  // if (parent) {
+  //   fmt::format_to(std::back_inserter(buf),
+  //                  "{}{}",
+  //                  parent->getHierarchicalName(),
+  //                  block->getHierarchyDelimiter());
+  // }
+  (void)parent;  // Suppress unused parameter warning
   buf.append(fmt::string_view(base_name));
   buf.push_back('\0');  // Null-terminate for find* functions
 

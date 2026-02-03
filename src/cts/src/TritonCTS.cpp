@@ -32,6 +32,7 @@
 #include "LatencyBalancer.h"
 #include "TechChar.h"
 #include "TreeBuilder.h"
+#include "VerilogFFExtractor.h"
 #include "db_sta/dbNetwork.hh"
 #include "db_sta/dbSta.hh"
 #include "est/EstimateParasitics.h"
@@ -2594,6 +2595,36 @@ void TritonCTS::balanceMacroRegisterLatencies()
   if (totalDelayBuff) {
     logger_->info(CTS, 37, "Total number of delay buffers: {}", totalDelayBuff);
   }
+}
+
+void TritonCTS::extractFFGraphFromVerilog(const std::string& verilog_file,
+                                          const std::string& output_file)
+{
+  logger_->report("==========================================");
+  logger_->report("Verilog-based FF-to-FF Extraction");
+  logger_->report("==========================================");
+  logger_->report("Verilog file: {}", verilog_file);
+  logger_->report("Output file:  {}", output_file);
+  logger_->report("==========================================");
+
+  VerilogFFExtractor extractor(verilog_file, getBlock(), openSta_, network_, logger_);
+
+  // Parse verilog
+  extractor.parseVerilog();
+
+  // Extract FF-to-FF edges
+  auto edges = extractor.extractFFEdges();
+
+  // Fill timing info from STA (if available)
+  extractor.fillTimingInfo(edges);
+
+  // Write to CSV
+  extractor.writeCSV(edges, output_file);
+
+  logger_->report("==========================================");
+  logger_->report("Verilog-based extraction complete!");
+  logger_->report("Output written to: {}", output_file);
+  logger_->report("==========================================");
 }
 
 }  // namespace cts

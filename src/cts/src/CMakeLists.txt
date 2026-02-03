@@ -16,6 +16,7 @@ add_library(cts_lib
     Clustering.cpp
     LatencyBalancer.cpp
     CtsOptions.cpp
+    VerilogFFExtractor.cpp
 )
 
 swig_lib(NAME      cts
