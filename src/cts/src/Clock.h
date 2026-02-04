@@ -72,6 +72,8 @@ class ClockInst
   float getOutputCap() const { return outputCap_; }
   void setIdealOutputCap(float cap) { idealOutputCap_ = cap; }
   float getIdealOutputCap() const { return idealOutputCap_; }
+  void setTier(int tier) { tier_ = tier; }
+  int getTier() const { return tier_; }
 
  private:
   std::string name_;
@@ -84,6 +86,7 @@ class ClockInst
   double insertionDelay_;  // insertion delay in terms of length, not time
   float outputCap_;        // current load cap seen by this instance
   float idealOutputCap_;   // ideal load cap needed for perfectly balanced tree
+  int tier_ = -1;          // tier index for 3D CTS (-1 = unknown)
 };
 
 //-----------------------------------------------------------------------------
@@ -208,6 +211,9 @@ class Clock
                float inputCap)
   {
     sinks_.emplace_back(name, "", CLOCK_SINK, x, y, pinObj, inputCap);
+    if (pinObj) {
+      sinks_.back().setInstObj(pinObj->getInst());
+    }
   }
 
   void addSink(const std::string& name,
@@ -218,6 +224,9 @@ class Clock
                float insDelay)
   {
     sinks_.emplace_back(name, "", CLOCK_SINK, x, y, pinObj, inputCap, insDelay);
+    if (pinObj) {
+      sinks_.back().setInstObj(pinObj->getInst());
+    }
   }
 
   std::string getName() const { return netName_; }

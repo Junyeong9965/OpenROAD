@@ -251,6 +251,9 @@ void HTreeBuilder::preSinkClustering(
       const int target_tier = getDominantTierFromInsts(clusterClockInsts);
       const std::string sink_buffer
           = mapBufferMasterToTier(options_->getSinkBuffer(), target_tier, db_);
+      logger_->info(utl::CTS, 314,
+                    "3D-CTS leaf cluster {}: tier={}, buffer={}",
+                    clusterCount, target_tier, sink_buffer);
       Point<double> rootBufLoc = legalizeOneBuffer(center, sink_buffer);
       commitMoveLoc(center, rootBufLoc);
 
@@ -260,6 +263,7 @@ void HTreeBuilder::preSinkClustering(
           sink_buffer,
           rootBufLoc.getX() * wireSegmentUnit_,
           rootBufLoc.getY() * wireSegmentUnit_);
+      rootBuffer.setTier(target_tier);
       if (center != rootBufLoc) {
         debugPrint(logger_,
                    CTS,
@@ -387,11 +391,13 @@ int HTreeBuilder::getDominantTierFromSinkLocs(
     if (inst == nullptr) {
       continue;
     }
+    int tier = -1;
     odb::dbInst* db_inst = inst->getDbInst();
-    if (db_inst == nullptr) {
-      continue;
+    if (db_inst != nullptr) {
+      tier = db_inst->getTier();
+    } else {
+      tier = inst->getTier();
     }
-    const int tier = db_inst->getTier();
     if (tier == 0) {
       tier0++;
     } else if (tier == 1) {
@@ -2061,6 +2067,9 @@ void HTreeBuilder::createClockSubNets()
   const int root_tier = getDominantTierFromClockSinks();
   const std::string root_buffer
       = mapBufferMasterToTier(options_->getRootBuffer(), root_tier, db_);
+  logger_->info(utl::CTS, 315,
+                "3D-CTS root buffer: tier={}, buffer={}",
+                root_tier, root_buffer);
   Point<double> legalCenter = legalizeOneBuffer(center, root_buffer);
   sinkRegion_.setCenter(legalCenter);
   commitMoveLoc(center, legalCenter);
@@ -2104,13 +2113,16 @@ void HTreeBuilder::createClockSubNets()
         topLevelTopology.getBranchSinksLocations(idx));
     const std::string branch_root_buffer = mapBufferMasterToTier(
         options_->getRootBuffer(), branch_tier, db_);
+    logger_->info(utl::CTS, 316,
+                  "3D-CTS branch L1 idx={}: tier={}, buffer={}",
+                  idx, branch_tier, branch_root_buffer);
     Point<double> legalBranchPoint
         = legalizeOneBuffer(branchPoint, branch_root_buffer);
     commitMoveLoc(branchPoint, legalBranchPoint);
 
     // clang-format off
     if (branchPoint != legalBranchPoint) {
-      debugPrint(logger_, CTS, "legalizer", 2, 
+      debugPrint(logger_, CTS, "legalizer", 2,
 		 "createClockSubNets level 1 clk_buf_1_{}_ : {} => {}",
 		 std::to_string(idx), branchPoint, legalBranchPoint);
     } else {
@@ -2169,6 +2181,9 @@ void HTreeBuilder::createClockSubNets()
           = getDominantTierFromSinkLocs(topology.getBranchSinksLocations(idx));
       const std::string branch_root_buffer = mapBufferMasterToTier(
           options_->getRootBuffer(), branch_tier, db_);
+      logger_->info(utl::CTS, 317,
+                    "3D-CTS branch L{} idx={}: tier={}, buffer={}",
+                    levelIdx+1, idx, branch_tier, branch_root_buffer);
       Point<double> legalBranchPoint
           = legalizeOneBuffer(branchPoint, branch_root_buffer);
       commitMoveLoc(branchPoint, legalBranchPoint);
