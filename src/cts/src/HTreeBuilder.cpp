@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "Clustering.h"
+#include "Cts3DDatabase.h"  // JYJ (2026-02-06) Added for 3D tier management
 #include "SinkClustering.h"
 #include "TechChar.h"
 #include "TreeBuilder.h"
@@ -25,52 +26,9 @@ namespace cts {
 
 using utl::CTS;
 
-namespace {
-bool hasSuffix(const std::string& name, const std::string& suffix)
-{
-  if (name.size() < suffix.size()) {
-    return false;
-  }
-  return name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-std::string mapBufferMasterToTier(const std::string& master,
-                                  int target_tier,
-                                  odb::dbDatabase* db)
-{
-  if (target_tier != 0 && target_tier != 1) {
-    return master;
-  }
-  if (db == nullptr || master.empty()) {
-    return master;
-  }
-
-  std::string candidate = master;
-  if (target_tier == 1) {
-    if (hasSuffix(master, "_bottom")) {
-      candidate = master.substr(0, master.size() - 7) + "_upper";
-    } else if (!hasSuffix(master, "_upper")) {
-      candidate = master + "_upper";
-    }
-  } else {
-    if (hasSuffix(master, "_upper")) {
-      candidate = master.substr(0, master.size() - 6) + "_bottom";
-    } else if (!hasSuffix(master, "_bottom")) {
-      candidate = master + "_bottom";
-    }
-  }
-
-  if (candidate == master) {
-    return master;
-  }
-
-  if (db->findMaster(candidate.c_str()) != nullptr) {
-    return candidate;
-  }
-
-  return master;
-}
-}  // namespace
+// JYJ (2026-02-06) Removed anonymous namespace containing hasSuffix() and
+// mapBufferMasterToTier() — moved to Cts3DDatabase::hasSuffix() and
+// Cts3DDatabase::getBufferForTier()
 
 Point<double> HTreeBuilder::legalizeOneBuffer(Point<double> bufferLoc,
                                               const std::string& bufferName)
@@ -78,6 +36,78 @@ Point<double> HTreeBuilder::legalizeOneBuffer(Point<double> bufferLoc,
   Point<double> legalLoc
       = TreeBuilder::legalizeOneBuffer(bufferLoc, bufferName);
   return resolveLocationCollision(legalLoc);
+}
+
+// JYJ (2026-02-09) Phase 3: Override computeDist to add HB penalty for cross-tier pairs
+// This makes k-means clustering naturally avoid cross-tier clusters during SinkClustering
+double HTreeBuilder::computeDist(const Point<double>& x, const Point<double>& y)
+{
+  // Get base distance from parent TreeBuilder::computeDist()
+  double baseDist = TreeBuilder::computeDist(x, y);
+
+  // If no 3DDB available, fall back to base distance
+  if (cts3dDb_ == nullptr || techChar_ == nullptr) {
+    return baseDist;
+  }
+
+  // Look up ClockInst for both points
+  auto itX = mapLocationToSink_.find(x);
+  auto itY = mapLocationToSink_.find(y);
+
+  // If either point is not a sink (e.g., branching point), no cross-tier penalty
+  if (itX == mapLocationToSink_.end() || itY == mapLocationToSink_.end()) {
+    return baseDist;
+  }
+
+  ClockInst* instX = itX->second;
+  ClockInst* instY = itY->second;
+
+  if (instX == nullptr || instY == nullptr) {
+    return baseDist;
+  }
+
+  // Get tiers for both instances
+  odb::dbInst* dbInstX = instX->getDbInst();
+  odb::dbInst* dbInstY = instY->getDbInst();
+
+  if (dbInstX == nullptr || dbInstY == nullptr) {
+    return baseDist;
+  }
+
+  int tierX = cts3dDb_->getInstTier(dbInstX);
+  int tierY = cts3dDb_->getInstTier(dbInstY);
+
+  // If both on same tier or tier unknown, no penalty
+  if (tierX < 0 || tierY < 0 || tierX == tierY) {
+    return baseDist;
+  }
+
+  // Cross-tier pair detected: add HB penalty
+  // Get wire RC from TechChar (per DBU)
+  double wireResPerDBU = techChar_->getResPerDBU();
+  double wireCapPerDBU = techChar_->getCapPerDBU();
+
+  // Convert to per normalized unit (SinkClustering works in normalized coordinates)
+  // where 1 normalized unit = wireSegmentUnit_ DBU
+  double wireResPerUnit = wireResPerDBU * wireSegmentUnit_;
+  double wireCapPerUnit = wireCapPerDBU * wireSegmentUnit_;
+
+  // Get HB equivalent distance in normalized units
+  double hbPenalty = cts3dDb_->getHbtEquivalentDistance(wireResPerUnit,
+                                                         wireCapPerUnit);
+
+  // For debug: convert to physical units (microns)
+  double dbUnitsPerMicron = db_->getTech()->getDbUnitsPerMicron();
+  double hbDistMicrons = hbPenalty * wireSegmentUnit_ / dbUnitsPerMicron;
+
+  debugPrint(logger_, CTS, "clustering", 2,
+             "Cross-tier pair detected: ({},{}) tier {} <-> ({},{}) tier {}, "
+             "adding HB penalty {:.2f} norm units ({:.2f} um)",
+             x.getX(), x.getY(), tierX,
+             y.getX(), y.getY(), tierY,
+             hbPenalty, hbDistMicrons);
+
+  return baseDist + hbPenalty;
 }
 
 void HTreeBuilder::preSinkClustering(
@@ -221,6 +251,18 @@ void HTreeBuilder::preSinkClustering(
 
   unsigned clusterCount = 0;
 
+  // JYJ (2026-02-09) Tier-aware clustering: detect cross-tier clusters
+  // Calculate HB equivalent distance for cross-tier penalty awareness
+  const double wire_res_per_unit = cts3dDb_->getResPerDBU(0) * wireSegmentUnit_;
+  const double wire_cap_per_unit = cts3dDb_->getCapPerDBU(0) * wireSegmentUnit_;
+  const double hb_equivalent_dist = cts3dDb_->getHbtEquivalentDistance(
+      wire_res_per_unit, wire_cap_per_unit);
+
+  // Note: Current k-means clustering uses geometric distance only.
+  // TODO Phase 3: Modify SinkClustering/CKMeans to inject hb_equivalent_dist
+  // as penalty when computing distance between sinks on different tiers.
+  // This would actively discourage cross-tier clusters during k-means.
+
   std::vector<std::pair<float, float>> newSinkLocations;
   for (const std::vector<unsigned>& cluster :
        matching.sinkClusteringSolution()) {
@@ -248,9 +290,28 @@ void HTreeBuilder::preSinkClustering(
           = (xSum / (float) pointCounter);  // geometric center of cluster
       const float normCenterY = (ySum / (float) pointCounter);
       Point<double> center((double) normCenterX, (double) normCenterY);
-      const int target_tier = getDominantTierFromInsts(clusterClockInsts);
+      // JYJ (2026-02-06) Replaced getDominantTierFromInsts + mapBufferMasterToTier
+      // with Cts3DDatabase calls
+      const int target_tier = cts3dDb_->getDominantTier(clusterClockInsts);
       const std::string sink_buffer
-          = mapBufferMasterToTier(options_->getSinkBuffer(), target_tier, db_);
+          = cts3dDb_->getBufferForTier(options_->getSinkBuffer(), target_tier);
+
+      // JYJ (2026-02-09) Detect cross-tier clustering
+      int tier0_count = 0, tier1_count = 0;
+      for (const ClockInst* inst : clusterClockInsts) {
+        const int inst_tier = cts3dDb_->getInstTier(inst->getDbInst());
+        if (inst_tier == 0) tier0_count++;
+        else if (inst_tier == 1) tier1_count++;
+      }
+      if (tier0_count > 0 && tier1_count > 0) {
+        logger_->warn(CTS, 364,
+                      "Cross-tier cluster detected: cluster={}, tier0={}, tier1={}, "
+                      "dominant_tier={}, HB_penalty={:.1f}um",
+                      clusterCount, tier0_count, tier1_count, target_tier,
+                      hb_equivalent_dist);
+        // TODO Phase 3: Minimize cross-tier clusters by modifying k-means distance metric
+      }
+
       logger_->info(utl::CTS, 314,
                     "3D-CTS leaf cluster {}: tier={}, buffer={}",
                     clusterCount, target_tier, sink_buffer);
@@ -263,7 +324,8 @@ void HTreeBuilder::preSinkClustering(
           sink_buffer,
           rootBufLoc.getX() * wireSegmentUnit_,
           rootBufLoc.getY() * wireSegmentUnit_);
-      rootBuffer.setTier(target_tier);
+      // JYJ (2026-02-07) Tier assignment through SSOT (Cts3DDatabase)
+      cts3dDb_->setClockInstTier(rootBuffer, target_tier);
       if (center != rootBufLoc) {
         debugPrint(logger_,
                    CTS,
@@ -351,86 +413,9 @@ Point<double> HTreeBuilder::resolveLocationCollision(
   return resolvedLocation;
 }
 
-int HTreeBuilder::getDominantTierFromInsts(
-    const std::vector<ClockInst*>& insts) const
-{
-  int tier0 = 0;
-  int tier1 = 0;
-  for (const ClockInst* inst : insts) {
-    if (inst == nullptr) {
-      continue;
-    }
-    odb::dbInst* db_inst = inst->getDbInst();
-    if (db_inst == nullptr) {
-      continue;
-    }
-    const int tier = db_inst->getTier();
-    if (tier == 0) {
-      tier0++;
-    } else if (tier == 1) {
-      tier1++;
-    }
-  }
-  if (tier0 == 0 && tier1 == 0) {
-    return -1;
-  }
-  return (tier1 > tier0) ? 1 : 0;
-}
-
-int HTreeBuilder::getDominantTierFromSinkLocs(
-    const std::vector<Point<double>>& sinkLocs) const
-{
-  int tier0 = 0;
-  int tier1 = 0;
-  for (const Point<double>& loc : sinkLocs) {
-    auto it = mapLocationToSink_.find(loc);
-    if (it == mapLocationToSink_.end()) {
-      continue;
-    }
-    ClockInst* inst = it->second;
-    if (inst == nullptr) {
-      continue;
-    }
-    int tier = -1;
-    odb::dbInst* db_inst = inst->getDbInst();
-    if (db_inst != nullptr) {
-      tier = db_inst->getTier();
-    } else {
-      tier = inst->getTier();
-    }
-    if (tier == 0) {
-      tier0++;
-    } else if (tier == 1) {
-      tier1++;
-    }
-  }
-  if (tier0 == 0 && tier1 == 0) {
-    return -1;
-  }
-  return (tier1 > tier0) ? 1 : 0;
-}
-
-int HTreeBuilder::getDominantTierFromClockSinks() const
-{
-  int tier0 = 0;
-  int tier1 = 0;
-  clock_.forEachSink([&](const ClockInst& inst) {
-    odb::dbInst* db_inst = inst.getDbInst();
-    if (db_inst == nullptr) {
-      return;
-    }
-    const int tier = db_inst->getTier();
-    if (tier == 0) {
-      tier0++;
-    } else if (tier == 1) {
-      tier1++;
-    }
-  });
-  if (tier0 == 0 && tier1 == 0) {
-    return -1;
-  }
-  return (tier1 > tier0) ? 1 : 0;
-}
+// JYJ (2026-02-06) Removed getDominantTierFromInsts, getDominantTierFromSinkLocs,
+// getDominantTierFromClockSinks — moved to Cts3DDatabase::getDominantTier() and
+// Cts3DDatabase::getDominantTierFromClock()
 
 void HTreeBuilder::initSinkRegion()
 {
@@ -2064,9 +2049,10 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
 void HTreeBuilder::createClockSubNets()
 {
   Point<double> center = sinkRegion_.getCenter();
-  const int root_tier = getDominantTierFromClockSinks();
+  // JYJ (2026-02-06) Replaced with Cts3DDatabase calls
+  const int root_tier = cts3dDb_->getDominantTierFromClock(clock_);
   const std::string root_buffer
-      = mapBufferMasterToTier(options_->getRootBuffer(), root_tier, db_);
+      = cts3dDb_->getBufferForTier(options_->getRootBuffer(), root_tier);
   logger_->info(utl::CTS, 315,
                 "3D-CTS root buffer: tier={}, buffer={}",
                 root_tier, root_buffer);
@@ -2109,13 +2095,36 @@ void HTreeBuilder::createClockSubNets()
     if (topLevelTopology.getBranchSinksLocations(idx).empty()) {
       return;
     }
-    const int branch_tier = getDominantTierFromSinkLocs(
-        topLevelTopology.getBranchSinksLocations(idx));
-    const std::string branch_root_buffer = mapBufferMasterToTier(
-        options_->getRootBuffer(), branch_tier, db_);
+    // JYJ (2026-02-06) Replaced with Cts3DDatabase calls
+    const int branch_tier = cts3dDb_->getDominantTier(
+        topLevelTopology.getBranchSinksLocations(idx), mapLocationToSink_);
+    const std::string branch_root_buffer = cts3dDb_->getBufferForTier(
+        options_->getRootBuffer(), branch_tier);
     logger_->info(utl::CTS, 316,
                   "3D-CTS branch L1 idx={}: tier={}, buffer={}",
                   idx, branch_tier, branch_root_buffer);
+
+    // JYJ (2026-02-09) Cross-tier HB delay consideration
+    if (branch_tier != root_tier) {
+      const double hb_res = cts3dDb_->getHbtResistance();
+      const double hb_cap = cts3dDb_->getHbtCapacitance();
+      const double hb_delay = hb_res * hb_cap;
+
+      // Convert HB delay to equivalent wire length for awareness
+      const double wire_res_per_unit = cts3dDb_->getResPerDBU(branch_tier) * wireSegmentUnit_;
+      const double wire_cap_per_unit = cts3dDb_->getCapPerDBU(branch_tier) * wireSegmentUnit_;
+      const double hb_equivalent_dist = cts3dDb_->getHbtEquivalentDistance(
+          wire_res_per_unit, wire_cap_per_unit);
+
+      logger_->warn(CTS, 362,
+                    "Cross-tier branch L1: branch_tier={}, root_tier={}, "
+                    "HB_delay={:.3e}s, equiv_dist={:.1f}um",
+                    branch_tier, root_tier, hb_delay, hb_equivalent_dist);
+
+      // TODO Phase 3: Integrate hb_equivalent_dist into SegmentBuilder cost model
+      // to actively discourage cross-tier connections during topology optimization
+    }
+
     Point<double> legalBranchPoint
         = legalizeOneBuffer(branchPoint, branch_root_buffer);
     commitMoveLoc(branchPoint, legalBranchPoint);
@@ -2146,8 +2155,9 @@ void HTreeBuilder::createClockSubNets()
                            db_,
                            branch_tier);
     if (!options_->getTreeBuffer().empty()) {
-      const std::string tree_buffer = mapBufferMasterToTier(
-          options_->getTreeBuffer(), branch_tier, db_);
+      // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
+      const std::string tree_buffer = cts3dDb_->getBufferForTier(
+          options_->getTreeBuffer(), branch_tier);
       builder.build(tree_buffer);
     } else {
       builder.build();
@@ -2177,13 +2187,37 @@ void HTreeBuilder::createClockSubNets()
       LevelTopology& parentTopology = topologyForEachLevel_[levelIdx - 1];
       Point<double> parentPoint = parentTopology.getBranchingPoint(parentIdx);
 
-      const int branch_tier
-          = getDominantTierFromSinkLocs(topology.getBranchSinksLocations(idx));
-      const std::string branch_root_buffer = mapBufferMasterToTier(
-          options_->getRootBuffer(), branch_tier, db_);
+      // JYJ (2026-02-06) Replaced with Cts3DDatabase calls
+      const int branch_tier = cts3dDb_->getDominantTier(
+          topology.getBranchSinksLocations(idx), mapLocationToSink_);
+      const std::string branch_root_buffer = cts3dDb_->getBufferForTier(
+          options_->getRootBuffer(), branch_tier);
       logger_->info(utl::CTS, 317,
                     "3D-CTS branch L{} idx={}: tier={}, buffer={}",
                     levelIdx+1, idx, branch_tier, branch_root_buffer);
+
+      // JYJ (2026-02-09) Cross-tier HB delay consideration
+      const int parent_tier = cts3dDb_->getDominantTier(
+          parentTopology.getBranchSinksLocations(parentIdx), mapLocationToSink_);
+      if (branch_tier != parent_tier) {
+        const double hb_res = cts3dDb_->getHbtResistance();
+        const double hb_cap = cts3dDb_->getHbtCapacitance();
+        const double hb_delay = hb_res * hb_cap;
+
+        // Convert HB delay to equivalent wire length
+        const double wire_res_per_unit = cts3dDb_->getResPerDBU(branch_tier) * wireSegmentUnit_;
+        const double wire_cap_per_unit = cts3dDb_->getCapPerDBU(branch_tier) * wireSegmentUnit_;
+        const double hb_equivalent_dist = cts3dDb_->getHbtEquivalentDistance(
+            wire_res_per_unit, wire_cap_per_unit);
+
+        logger_->warn(CTS, 363,
+                      "Cross-tier branch L{}: branch_tier={}, parent_tier={}, "
+                      "HB_delay={:.3e}s, equiv_dist={:.1f}um",
+                      levelIdx+1, branch_tier, parent_tier, hb_delay, hb_equivalent_dist);
+
+        // TODO Phase 3: Integrate into SegmentBuilder cost model
+      }
+
       Point<double> legalBranchPoint
           = legalizeOneBuffer(branchPoint, branch_root_buffer);
       commitMoveLoc(branchPoint, legalBranchPoint);
@@ -2223,8 +2257,9 @@ void HTreeBuilder::createClockSubNets()
       }
 
       if (!options_->getTreeBuffer().empty()) {
-        const std::string tree_buffer = mapBufferMasterToTier(
-            options_->getTreeBuffer(), branch_tier, db_);
+        // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
+        const std::string tree_buffer = cts3dDb_->getBufferForTier(
+            options_->getTreeBuffer(), branch_tier);
         builder.build(tree_buffer);
       } else {
         builder.build();
@@ -2451,8 +2486,9 @@ void SegmentBuilder::build(const std::string& forceBuffer)
       const std::string buffMaster = !forceBuffer.empty()
                                          ? forceBuffer
                                          : wireSegment.getBufferMaster(buffer);
+      // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
       const std::string tieredMaster
-          = mapBufferMasterToTier(buffMaster, targetTier_, db_);
+          = tree_->getCts3DDatabase()->getBufferForTier(buffMaster, targetTier_);
       Point<double> bufferLoc(x, y);
       Point<double> legalBufferLoc
           = tree_->legalizeOneBuffer(bufferLoc, tieredMaster);
@@ -2462,6 +2498,8 @@ void SegmentBuilder::build(const std::string& forceBuffer)
           tieredMaster,
           legalBufferLoc.getX() * techCharDistUnit_,
           legalBufferLoc.getY() * techCharDistUnit_);
+      // JYJ (2026-02-07) Tier assignment through SSOT (Cts3DDatabase)
+      tree_->getCts3DDatabase()->setClockInstTier(newBuffer, targetTier_);
 
       // clang-format off
       if (bufferLoc != legalBufferLoc) {
@@ -2499,13 +2537,16 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
     return;
   }
 
+  // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
   const std::string tieredMaster
-      = mapBufferMasterToTier(master, targetTier_, db_);
+      = tree_->getCts3DDatabase()->getBufferForTier(master, targetTier_);
   ClockInst& newBuffer
       = clock_->addClockBuffer(instPrefix_ + "_f",
                                tieredMaster,
                                target_.getX() * techCharDistUnit_,
                                target_.getY() * techCharDistUnit_);
+  // JYJ (2026-02-07) Tier assignment through SSOT (Cts3DDatabase)
+  tree_->getCts3DDatabase()->setClockInstTier(newBuffer, targetTier_);
   tree_->addTreeLevelBuffer(&newBuffer);
   // clang-format off
   debugPrint(getTree()->getLogger(), CTS, "legalizer", 2,

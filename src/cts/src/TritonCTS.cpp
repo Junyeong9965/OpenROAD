@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "Clock.h"
+#include "Cts3DDatabase.h"  // JYJ (2026-02-06) Added for 3D tier database
 #include "CtsOptions.h"
 #include "HTreeBuilder.h"
 #include "LatencyBalancer.h"
@@ -91,6 +92,18 @@ void TritonCTS::runTritonCts()
   options_->addOwner(block);
 
   setupCharacterization();
+
+  // JYJ (2026-02-06) Initialize 3D tier database from ODB
+  cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
+  cts3dDb_->populate();
+
+  // JYJ (2026-02-09) Copy wire RC from TechChar to 3D database
+  // Initially same for both tiers, can be split later if needed
+  const double wire_res = techChar_->getResPerDBU();
+  const double wire_cap = techChar_->getCapPerDBU();
+  cts3dDb_->setWireRC(0, wire_res, wire_cap);  // bottom tier
+  cts3dDb_->setWireRC(1, wire_res, wire_cap);  // upper tier
+
   findClockRoots();
   populateTritonCTS();
   if (builders_.empty()) {
@@ -108,6 +121,7 @@ void TritonCTS::runTritonCts()
 
   // reset
   techChar_.reset();
+  cts3dDb_.reset();  // JYJ (2026-02-06) Cleanup 3D tier database
   builders_.clear();
   staClockNets_.clear();
   visitedClockNets_.clear();
@@ -297,6 +311,10 @@ void TritonCTS::buildClockTrees()
 {
   for (auto& builder : builders_) {
     builder->setTechChar(*techChar_);
+    // JYJ (2026-02-06) Inject 3D tier database into each builder
+    if (cts3dDb_) {
+      builder->setCts3DDatabase(*cts3dDb_);
+    }
     builder->setDb(db_);
     builder->setLogger(logger_);
     builder->initBlockages();
@@ -2608,6 +2626,10 @@ void TritonCTS::extractFFGraphFromVerilog(const std::string& verilog_file,
   logger_->report("==========================================");
 
   VerilogFFExtractor extractor(verilog_file, getBlock(), openSta_, network_, logger_);
+  // JYJ (2026-02-06) Inject 3D database for tier queries
+  if (cts3dDb_) {
+    extractor.setCts3DDatabase(cts3dDb_.get());
+  }
 
   // Parse verilog
   extractor.parseVerilog();

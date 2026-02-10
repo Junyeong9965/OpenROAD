@@ -56,7 +56,7 @@ class SegmentBuilder
   ClockSubNet* drivingSubNet_;
   TreeBuilder* tree_;
   odb::dbDatabase* db_;
-  int targetTier_ = -1;
+  int targetTier_ = -1;  // JYJ (2026-02-06) Tier for buffer selection in 3D CTS
   unsigned numBufferLevels_ = 0;
 };
 
@@ -285,6 +285,9 @@ class HTreeBuilder : public TreeBuilder
                                   unsigned& outputCap,
                                   int& currWl) const;
 
+  // JYJ (2026-02-09) Phase 3: Override computeDist to add HB penalty for cross-tier pairs
+  double computeDist(const Point<double>& x, const Point<double>& y) override;
+
  private:
   void initSinkRegion();
   void computeLevelTopology(unsigned level, double width, double height);
@@ -375,10 +378,8 @@ class HTreeBuilder : public TreeBuilder
   std::vector<unsigned> clusterSizes() const { return clusterSizes_; }
   Point<double> resolveLocationCollision(
       const Point<double>& legalCenter) const;
-  int getDominantTierFromInsts(const std::vector<ClockInst*>& insts) const;
-  int getDominantTierFromSinkLocs(
-      const std::vector<Point<double>>& sinkLocs) const;
-  int getDominantTierFromClockSinks() const;
+  // JYJ (2026-02-06) Removed getDominantTierFromInsts, getDominantTierFromSinkLocs,
+  // getDominantTierFromClockSinks - moved to Cts3DDatabase
 
  private:
   Box<double> sinkRegion_;

@@ -17,6 +17,7 @@ add_library(cts_lib
     LatencyBalancer.cpp
     CtsOptions.cpp
     VerilogFFExtractor.cpp
+    Cts3DDatabase.cpp  # JYJ (2026-02-06) Added 3D tier database
 )
 
 swig_lib(NAME      cts

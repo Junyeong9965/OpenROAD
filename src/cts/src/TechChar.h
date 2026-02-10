@@ -170,6 +170,7 @@ class TechChar
 
   void createFakeEntries(unsigned length, unsigned fakeLength);
 
+  double getResPerDBU() const { return resPerDBU_; }  // JYJ (2026-02-09) Added getter for wire resistance
   double getCapPerDBU() const { return capPerDBU_; }
   utl::Logger* getLogger() { return options_->getLogger(); }
 

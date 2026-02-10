@@ -8,6 +8,7 @@
 #include <regex>
 #include <sstream>
 
+#include "Cts3DDatabase.h"  // JYJ (2026-02-06) Added for tier queries
 #include "odb/db.h"
 #include "db_sta/dbNetwork.hh"
 #include "db_sta/dbSta.hh"
@@ -40,11 +41,11 @@ bool VerilogFFExtractor::isRegisterCell(const std::string& cell_type) const
 
 void VerilogFFExtractor::parseVerilog()
 {
-  logger_->info(utl::CTS, 350, "Parsing verilog file: {}", verilog_path_);
+  logger_->info(utl::CTS, 354, "Parsing verilog file: {}", verilog_path_);
 
   std::ifstream file(verilog_path_);
   if (!file.is_open()) {
-    logger_->error(utl::CTS, 351, "Cannot open verilog file: {}", verilog_path_);
+    logger_->error(utl::CTS, 355, "Cannot open verilog file: {}", verilog_path_);
   }
 
   // Read entire file
@@ -57,7 +58,7 @@ void VerilogFFExtractor::parseVerilog()
   std::regex module_regex(R"(module\s+(\w+))");
   std::smatch module_match;
   if (!std::regex_search(content, module_match, module_regex)) {
-    logger_->error(utl::CTS, 352, "No module found in verilog file");
+    logger_->error(utl::CTS, 356, "No module found in verilog file");
   }
 
   std::string module_name = module_match[1].str();
@@ -270,9 +271,13 @@ void VerilogFFExtractor::fillLocations(FFEdgeVerilog& edge)
     from_inst->getLocation(x, y);
     edge.from_x = x;
     edge.from_y = y;
-    // Get tier from master name (_upper -> 1, _bottom -> 0)
-    std::string master = from_inst->getMaster()->getName();
-    edge.from_tier = (master.find("_upper") != std::string::npos) ? 1 : 0;
+    // JYJ (2026-02-06) Replaced master name parsing with Cts3DDatabase query
+    if (cts3dDb_) {
+      edge.from_tier = cts3dDb_->getInstTier(from_inst);
+    } else {
+      std::string master = from_inst->getMaster()->getName();
+      edge.from_tier = (master.find("__upper") != std::string::npos) ? 1 : 0;
+    }
   }
 
   if (to_inst) {
@@ -280,9 +285,13 @@ void VerilogFFExtractor::fillLocations(FFEdgeVerilog& edge)
     to_inst->getLocation(x, y);
     edge.to_x = x;
     edge.to_y = y;
-    // Get tier from master name (_upper -> 1, _bottom -> 0)
-    std::string master = to_inst->getMaster()->getName();
-    edge.to_tier = (master.find("_upper") != std::string::npos) ? 1 : 0;
+    // JYJ (2026-02-06) Replaced master name parsing with Cts3DDatabase query
+    if (cts3dDb_) {
+      edge.to_tier = cts3dDb_->getInstTier(to_inst);
+    } else {
+      std::string master = to_inst->getMaster()->getName();
+      edge.to_tier = (master.find("__upper") != std::string::npos) ? 1 : 0;
+    }
   }
 }
 

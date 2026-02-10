@@ -43,6 +43,7 @@ struct Tree;
 namespace cts {
 
 class ClockInst;
+class Cts3DDatabase;  // JYJ (2026-02-06) Forward decl for 3D tier database
 class CtsOptions;
 class TechChar;
 class StaEngine;
@@ -218,6 +219,7 @@ class TritonCTS
   utl::Logger* logger_ = nullptr;
   CtsOptions* options_ = nullptr;
   std::unique_ptr<TechChar> techChar_;
+  std::unique_ptr<Cts3DDatabase> cts3dDb_;  // JYJ (2026-02-06) 3D tier database
   rsz::Resizer* resizer_ = nullptr;
   est::EstimateParasitics* estimate_parasitics_ = nullptr;
   std::vector<std::unique_ptr<TreeBuilder>> builders_;

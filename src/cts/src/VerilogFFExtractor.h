@@ -26,6 +26,8 @@ class Logger;
 
 namespace cts {
 
+class Cts3DDatabase;  // JYJ (2026-02-06) Forward decl for 3D tier queries
+
 struct FFEdgeVerilog {
   std::string from_ff;
   std::string to_ff;
@@ -34,10 +36,10 @@ struct FFEdgeVerilog {
   // Locations (will be filled from ODB if available)
   int from_x = 0;
   int from_y = 0;
-  int from_tier = 0;
+  int from_tier = 0;  // JYJ (2026-02-06) Tier info for 3D CTS
   int to_x = 0;
   int to_y = 0;
-  int to_tier = 0;
+  int to_tier = 0;    // JYJ (2026-02-06) Tier info for 3D CTS
 
   // Setup timing (max path - will be filled from STA if available)
   float slack_max = 0.0f;
@@ -63,6 +65,9 @@ public:
                      sta::dbNetwork* network,
                      utl::Logger* logger);
 
+  // JYJ (2026-02-06) Set 3D database for tier queries (optional)
+  void setCts3DDatabase(Cts3DDatabase* db3d) { cts3dDb_ = db3d; }
+
   // Parse verilog file to extract instances and connections
   void parseVerilog();
 
@@ -82,6 +87,7 @@ private:
   sta::dbSta* sta_;
   sta::dbNetwork* network_;
   utl::Logger* logger_;
+  Cts3DDatabase* cts3dDb_ = nullptr;  // JYJ (2026-02-06) 3D tier database
 
   // Parsed data
   std::unordered_map<std::string, RegisterInfo> registers_;
