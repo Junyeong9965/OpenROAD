@@ -4,6 +4,10 @@
 // JYJ (2026-02-06) Created Cts3DDatabase: centralized 3D tier management
 // for True 3D CTS. Replaces scattered tier logic in HTreeBuilder and
 // VerilogFFExtractor with a single source of truth.
+// JYJ (2026-02-23) V32a: Added explicit tier buffer pair mapping to fix
+// getBufferForTier() fallback when cell names differ across technology nodes
+// (e.g., "BUF_X4_bottom" -> "BUFx4_ASAP7_75t_R_upper" instead of
+// the non-existent "BUF_X4_upper").
 
 #pragma once
 
@@ -45,10 +49,22 @@ class Cts3DDatabase
   // --- Buffer master mapping ---
   // JYJ (2026-02-06) Moved from HTreeBuilder::mapBufferMasterToTier()
 
-  // Map a buffer master name to tier-specific variant
-  // e.g. "BUFx4_ASAP7_75t_R__bottom" + tier=1 -> "BUFx4_ASAP7_75t_R__upper"
+  // Map a buffer master name to tier-specific variant.
+  // First checks explicit bottom<->upper pair set via setTierBufferPair(),
+  // then falls back to suffix substitution (_bottom <-> _upper).
+  // e.g. with pair ("BUF_X4_bottom", "BUF_X4_upper"):
+  //   "BUF_X4_bottom" + tier=1 -> "BUF_X4_upper"
+  // e.g. suffix fallback (no pair set):
+  //   "BUFx4_ASAP7_75t_R_bottom" + tier=1 -> "BUFx4_ASAP7_75t_R_upper"
   std::string getBufferForTier(const std::string& baseMaster,
                                int targetTier) const;
+
+  // JYJ (2026-02-23) V32a: Register explicit bottom/upper buffer pair.
+  // Bypasses suffix-only guessing when cell names differ across tech nodes.
+  // Call after populate(), before tree building.
+  // e.g. setTierBufferPair("BUF_X4_bottom", "BUF_X4_upper")
+  void setTierBufferPair(const std::string& bottomBuf,
+                         const std::string& upperBuf);
 
   // --- Dominant tier computation ---
   // JYJ (2026-02-06) Moved from HTreeBuilder::getDominantTierFrom*()
@@ -95,6 +111,17 @@ class Cts3DDatabase
   double getHbtEquivalentDistance(double wireResPerUnit,
                                   double wireCapPerUnit) const;
 
+  // --- Pre-CTS skew targets (SG-CTS) ---
+  // JYJ (2026-02-21) Load per-FF arrival time targets from LP solver
+  void loadSkewTargets(const std::string& csv_path);
+  double getSkewTarget(const std::string& ff_name) const;
+  double getSkewTarget(odb::dbInst* inst) const;
+  bool hasSkewTargets() const { return !skewTargetMap_.empty(); }
+  int getSkewTargetCount() const
+  {
+    return static_cast<int>(skewTargetMap_.size());
+  }
+
   // --- Statistics ---
 
   int getNumInstancesOnTier(int tier) const;
@@ -119,9 +146,17 @@ class Cts3DDatabase
   std::array<double, 2> resPerDBU_ = {0.0, 0.0};
   std::array<double, 2> capPerDBU_ = {0.0, 0.0};
 
+  // JYJ (2026-02-23) V32a: Explicit bottom/upper buffer pair for cross-tech mapping.
+  // Set via setTierBufferPair(); empty strings mean "use suffix fallback only".
+  std::string bottomBufName_;
+  std::string upperBufName_;
+
   // Hybrid Bond parasitic values (not TSV - this is face-to-face bonding)
   double hbtRes_ = 0.0;   // ohms
   double hbtCap_ = 0.0;   // farads
+
+  // Pre-CTS skew targets: ff_instance_name -> target arrival offset (ns)
+  std::unordered_map<std::string, double> skewTargetMap_;
 };
 
 }  // namespace cts

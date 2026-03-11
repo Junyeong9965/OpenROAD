@@ -71,6 +71,16 @@ class TritonCTS
   // FF-to-FF timing graph extraction for 3D-CTS (Verilog-based with tier info)
   void extractFFGraphFromVerilog(const std::string& verilog_file,
                                   const std::string& output_file);
+
+  // JYJ (2026-02-21) Pre-CTS skew targets for SG-CTS
+  void loadSkewTargets(const std::string& csv_path);
+
+  // JYJ (2026-02-23) V32: Estimate per-FF physical achievability bounds for LP-SAFETY.
+  // Computes t_via from HBT parasitic and writes bounds CSV for pre_cts_skew_lp.py.
+  // output_csv: destination path (ff_name,tier,t_min_ns,t_max_ns)
+  // max_skew_ns: per-FF CTS delay budget (default 100ps = 0.1ns)
+  void estimateLeafLatencies(const std::string& output_csv, double max_skew_ns);
+
   TechChar* getCharacterization() { return techChar_.get(); }
   odb::dbBlock* getBlock() { return db_->getChip()->getBlock(); }
   int setClockNets(const char* names);

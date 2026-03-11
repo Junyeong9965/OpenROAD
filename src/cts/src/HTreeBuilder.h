@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -396,6 +397,140 @@ class HTreeBuilder : public TreeBuilder
   static constexpr int min_clustering_macro_sinks_ = 10;
   std::vector<unsigned> clusterDiameters_ = {50, 100, 200};
   std::vector<unsigned> clusterSizes_ = {10, 20, 30};
+
+  // JYJ (2026-02-21) Step 3: Skew-aware clustering penalty weight
+  // β · |target_a - target_b| is added to computeDist() to group FFs
+  // with similar arrival targets into the same cluster.
+  double skewTargetBeta_ = 0.0;
+
+  // JYJ (2026-02-21) Step 4: Per-branch delay targets
+  // Maps (levelIdx, branchIdx) → mean arrival target for that branch.
+  // Used in createClockSubNets() to insert/skip delay buffers.
+  std::map<std::pair<int, unsigned>, double> branchDelayTargets_;
+  double globalMeanTarget_ = 0.0;
+  double delayTargetThreshold_ = 0.0;  // ns, from CTS_DELAY_TARGET_THRESHOLD env
+  void computeBranchDelayTargets();
+
+  // JYJ (2026-02-23) V31: Useful-skew wire length adjustment
+  // Instead of a balanced (equal-wire) H-tree, shift each branch point
+  // radially from the clock root based on the cluster's mean LP skew target.
+  //   shift_um = wireSkewScale_ * (T_cluster - T_global) / wireDelayPerUnit_
+  // Positive T_cluster → branch moves farther from root → longer wire → later clock.
+  // Negative T_cluster → branch moves closer to root → shorter wire → earlier clock.
+  // CTS_WIRE_SKEW_SCALE env var (default 1.0, 0 = off / zero-skew mode)
+  // CTS_WIRE_DELAY_PS_UM env var: wire+buffer delay per unit length (ps/um, default 1.0)
+  double wireSkewScale_    = 0.0;  // disabled by default (backward compatible)
+  double wireDelayPerUnit_ = 0.001; // ns/um = 1.0 ps/um (ASAP7 typical CTS layer)
+
+  // JYJ (2026-02-23) V32b: N-buffer chain leaf delay parameters.
+  // Step 4 inserts N = round(branchMeanTarget / singleBufDelay_) delay buffers
+  // in series at each leaf branch, instead of the V32 binary (0 or 1) approach.
+  // Driven by absolute LP-TNS target (not relative to globalMean).
+  //   CTS_LEAF_BUF_DELAY_NS  : delay per single buffer cell in ns (default 12ps)
+  //   CTS_MAX_LEAF_DELAY_BUFS: max buffers per leaf branch (default 3)
+  double singleBufDelay_   = 0.012;  // ns, from CTS_LEAF_BUF_DELAY_NS
+  int    maxLeafDelayBufs_ = 3;      // from CTS_MAX_LEAF_DELAY_BUFS
+
+  // JYJ (2026-02-23) V32c: cluster buffer → mean LP skew target map.
+  // preSinkClustering() replaces individual FF positions in mapLocationToSink_
+  // with cluster-buffer ClockInsts (clkbuf_leaf_X). These buffer names are NOT
+  // in the LP CSV, so getSkewTarget(bufName) always returns 0.
+  // Fix: compute mean FF target per cluster at clustering time and store here.
+  // getClockInstTarget() uses this map for cluster buffers, LP CSV for raw FFs.
+  std::unordered_map<ClockInst*, double> clusterBufTarget_;
+  double getClockInstTarget(ClockInst* inst) const;
+
+  // JYJ (2026-02-25) V37: Target-aware adaptive sub-clustering parameters.
+  // After SinkClustering groups FFs spatially, clusters with high LP target
+  // spread are split into sub-clusters so that per-leaf N-chain can cover
+  // the reduced spread effectively.
+  //   spread > split2way → 2-way split at median
+  //   spread > split3way → 3-way split at terciles
+  // CTS_ENABLE_TARGET_SPLIT (default 1): enable/disable
+  // CTS_SPLIT_THRESHOLD_2WAY_PS (default 20): 2-way threshold in ps
+  // CTS_SPLIT_THRESHOLD_3WAY_PS (default 40): 3-way threshold in ps
+  bool   enableTargetSplit_      = true;
+  double splitThreshold2wayNs_   = 0.020;  // ns
+  double splitThreshold3wayNs_   = 0.040;  // ns
+
+  // JYJ (2026-03-01) V48: Tier-aware cluster split.
+  // If a leaf cluster has both bottom and upper FFs, split into two sub-clusters
+  // so each gets the correct tier buffer (BUF_X4_bottom / BUF_X4_upper).
+  // CTS_ENABLE_TIER_SPLIT (default 0): enable/disable
+  bool enableTierSplit_ = false;
+
+  // JYJ (2026-02-25) V37: Per-level globalMean for intermediate delay buffers.
+  // computeBranchDelayTargets() now computes targets at ALL levels (not just leaf).
+  // perLevelGlobalMean_[levelIdx] = weighted average of branch means at that level.
+  std::map<int, double> perLevelGlobalMean_;
+
+  // JYJ (2026-02-26) V39: Per-FF relay buffer parameters.
+  // Replace per-BRANCH N-buffer (coverage=10.9%) with per-FF relay chains.
+  // Leaf buffer -> [relay_0] -> [relay_1] -> FF  (high-target FFs)
+  // Leaf buffer -> FF                            (low/zero-target FFs)
+  // H-tree structure (62 leaf buffers) preserved; relays added after leaf only.
+  //   CTS_ENABLE_PER_FF_RELAY:    0=off (legacy per-branch), 1=on
+  //   CTS_PER_FF_BUF_DELAY_NS:   actual Liberty delay per relay buffer (ns)
+  //   CTS_PER_FF_MAX_RELAY:       max relay buffers per FF
+  //   CTS_PER_FF_HOLD_GUARD_NS:  min residual hold slack after relay (ns)
+  //   CTS_PER_FF_MIN_TARGET_NS:   skip FFs with delta < this (ns)
+  //   CTS_TIMING_GRAPH_CSV:       path to ff_timing_graph.csv for hold budgets
+  // JYJ (2026-02-28) V47: Elmore-based x_useful relay positioning.
+  // Replaces equal interpolation with exact position x_useful:
+  //   delta(x) = d_buf - rc * x * (L - x)   [ps, rc = rw[kOhm/um]*cw[fF/um]]
+  //   x_useful  = [L - sqrt(L^2 - 4*(d_buf-target)/rc)] / 2  [um]
+  // Single relay at x_useful delivers target_delta exactly (no quantization).
+  // Falls back to multi-relay equal spacing when target > d_buf.
+  //   CTS_RELAY_RW_PER_UM:  wire resistance (kOhm/um); 0 = Elmore disabled
+  //   CTS_RELAY_CW_PER_UM:  wire capacitance (fF/um)
+  //   CTS_DBU_PER_UM:       database units per micron (default 2000)
+  bool   enablePerFfRelay_     = false;
+  double perFfBufDelay_        = 0.015;   // ns (V47: corrected to actual 15ps)
+  int    perFfMaxRelay_        = 3;
+  double perFfHoldGuard_       = 0.020;   // ns
+  double perFfMinTarget_       = 0.010;   // ns
+  // V47: Elmore wire RC parameters for x_useful computation
+  double relayRwKOhmPerUm_     = 0.0;    // kOhm/um (0 = Elmore disabled)
+  double relayCwFfPerUm_       = 0.0;    // fF/um
+  double relayDbuPerUm_        = 2000.0; // DB units per micron
+
+  // Per-FF hold budget: ff_name -> min hold slack (ns) as capture FF
+  std::unordered_map<std::string, double> perFfHoldBudget_;
+  void loadPerFfHoldBudgets(const std::string& timingGraphCsv);
+  // JYJ (2026-02-26) V40: Load IO edge hold budgets (PI→FF hold slack)
+  // to prevent relay insertion on FFs with tight PI→FF hold.
+  void loadIoHoldBudgets(const std::string& ioCsv);
+
+  // JYJ (2026-03-05) V49: Grouped Delay Chain parameters.
+  // Instead of per-FF relay (1 chain per FF → many nets → GRT-0183),
+  // group FFs within each leaf cluster by quantized LP target delta.
+  // Group 0 (delta < min_delta): direct connection to leaf buffer.
+  // Group k (k > 0): shared chain of k delay buffers → all group FFs.
+  //   CTS_ENABLE_GROUPED_DELAY:         0/1 (default 0)
+  //   CTS_GROUPED_DELAY_MAX_DEPTH:      max chain depth (default 3)
+  //   CTS_GROUPED_DELAY_MIN_DELTA_NS:   min delta to create group (default 0.010)
+  bool   enableGroupedDelay_       = false;
+  int    groupedDelayMaxDepth_     = 3;
+  double groupedDelayMinDelta_     = 0.010;  // ns (10ps)
+
+  // JYJ (2026-03-06) V50: Cluster-Uniform Depth mode.
+  // When enabled, all FFs in a leaf cluster share a SINGLE chain depth k_c
+  // computed from the cluster median LP target delta.
+  // V49a created up to MAX_DEPTH distinct depth groups per cluster →
+  // 155 extra buffers (62 clusters × ~2.5 avg groups).
+  // V50 creates exactly 1 chain per cluster (depth=k_c or 0) →
+  // ~62 extra buffers max (1 chain per cluster), reducing buffer count ~60%.
+  // Hold safety: k_c capped by min(hold_budget) across all FFs in cluster.
+  //   CTS_GROUPED_DELAY_CLUSTER_UNIFORM: 0/1 (default 0; set 1 for V50 mode)
+  bool enableClusterUniform_       = false;
+
+  // V39: Env guard for V37 intermediate delay buffers (default off)
+  bool enableMidDelayBufs_ = false;  // CTS_ENABLE_MID_DELAY_BUFS
+
+  // JYJ (2026-02-26) V40: CKMeans target-aware branching weight.
+  // When > 0, CKMeans distance includes target penalty so H-tree branching
+  // groups FFs with similar LP targets together → better V31 wire shift.
+  double ckmeansTargetBeta_ = 0.0;  // CTS_CKMEANS_TARGET_BETA
 };
 
 }  // namespace cts

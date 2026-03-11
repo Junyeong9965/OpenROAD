@@ -650,6 +650,8 @@ bool Opendp::shiftMove(Node* cell)
   // magic number alert
   const GridY boundary_margin{3};
   const GridX margin_width{grid_->gridPaddedWidth(cell).v * boundary_margin.v};
+  // 3D-aware: only consider same-tier cells for shift
+  const int shift_tier = enable_3d_dpl_ ? getCellTier(cell) : -1;
   std::set<Node*> region_cells;
   for (GridX x = grid_pt.x - margin_width; x < grid_pt.x + margin_width; x++) {
     for (GridY y = grid_pt.y - boundary_margin; y < grid_pt.y + boundary_margin;
@@ -658,6 +660,11 @@ bool Opendp::shiftMove(Node* cell)
       if (pixel) {
         Node* cell = pixel->cell;
         if (cell && !cell->isFixed()) {
+          // 3D: skip cells on different tier
+          if (enable_3d_dpl_ && shift_tier >= 0 && pixel->cell_tier >= 0
+              && shift_tier != pixel->cell_tier) {
+            continue;
+          }
           region_cells.insert(cell);
         }
       }
@@ -687,6 +694,14 @@ bool Opendp::shiftMove(Node* cell)
 
 bool Opendp::swapCells(Node* cell1, Node* cell2)
 {
+  // 3D-aware DPL: do not swap cells across different tiers
+  if (enable_3d_dpl_) {
+    const int t1 = getCellTier(cell1);
+    const int t2 = getCellTier(cell2);
+    if (t1 >= 0 && t2 >= 0 && t1 != t2) {
+      return false;
+    }
+  }
   if (cell1 != cell2 && !cell1->isHold() && !cell2->isHold()
       && cell1->getWidth() == cell2->getWidth()
       && cell1->getHeight() == cell2->getHeight() && !cell1->isFixed()
@@ -952,14 +967,26 @@ bool Opendp::checkPixels(const Node* cell,
   }
 
   odb::dbSite* site = cell->getSite();
+  // 3D-aware DPL: determine tier of the cell being placed
+  const int my_tier = enable_3d_dpl_ ? getCellTier(cell) : -1;
   for (GridY y1 = y; y1 < y_end; y1++) {
     const bool first_row = (y1 == y);
     for (GridX x1 = x; x1 < x_end; x1++) {
       const Pixel* pixel = grid_->gridPixel(x1, y1);
-      if (pixel == nullptr || pixel->cell || !pixel->is_valid
+      if (pixel == nullptr || !pixel->is_valid
           || (cell->inGroup() && pixel->group != cell->getGroup())
           || (!cell->inGroup() && pixel->group)
           || (first_row && !grid_->getSiteOrientation(x1, y1, site))) {
+        return false;
+      }
+      // 3D-aware overlap check: pixel occupied by a cell
+      if (pixel->cell) {
+        if (enable_3d_dpl_ && my_tier >= 0 && pixel->cell_tier >= 0
+            && my_tier != pixel->cell_tier) {
+          // Different tier — not a real overlap in 3D, skip
+          continue;
+        }
+        // Same tier or tier unknown — real overlap
         return false;
       }
     }
@@ -976,14 +1003,27 @@ bool Opendp::checkPixels(const Node* cell,
     const GridX x_finish = min(x_end, grid_->getRowSiteCount() - 1);
     const GridY y_finish = min(y_end, grid_->getRowCount() - 1);
 
-    auto isAbutted = [this](const GridX x, const GridY y) {
+    auto isAbutted = [this, my_tier](const GridX x, const GridY y) {
       const Pixel* pixel = grid_->gridPixel(x, y);
-      return (pixel == nullptr || pixel->cell);
+      if (pixel == nullptr) return true;
+      if (!pixel->cell) return false;
+      // 3D: different-tier cell doesn't count as abutting
+      if (enable_3d_dpl_ && my_tier >= 0 && pixel->cell_tier >= 0
+          && my_tier != pixel->cell_tier) {
+        return false;
+      }
+      return true;
     };
 
-    auto cellAtSite = [this](const GridX x, const GridY y) {
+    auto cellAtSite = [this, my_tier](const GridX x, const GridY y) {
       const Pixel* pixel = grid_->gridPixel(x, y);
-      return (pixel != nullptr && pixel->cell);
+      if (pixel == nullptr || !pixel->cell) return false;
+      // 3D: different-tier cell doesn't count
+      if (enable_3d_dpl_ && my_tier >= 0 && pixel->cell_tier >= 0
+          && my_tier != pixel->cell_tier) {
+        return false;
+      }
+      return true;
     };
     for (GridY y = y_begin; y < y_finish; ++y) {
       // left side

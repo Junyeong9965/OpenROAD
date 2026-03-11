@@ -27,7 +27,8 @@
 #include <vector>
 
 #include "Clock.h"
-#include "Cts3DDatabase.h"  // JYJ (2026-02-06) Added for 3D tier database
+#include "Cts3DDatabase.h"        // JYJ (2026-02-06) Added for 3D tier database
+#include "ClockLatencyEstimator.h"  // JYJ (2026-02-23) V32: per-FF physical achievability
 #include "CtsOptions.h"
 #include "HTreeBuilder.h"
 #include "LatencyBalancer.h"
@@ -94,7 +95,11 @@ void TritonCTS::runTritonCts()
   setupCharacterization();
 
   // JYJ (2026-02-06) Initialize 3D tier database from ODB
-  cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
+  // JYJ (2026-02-21) Preserve pre-loaded cts3dDb_ (e.g., with skew targets)
+  const bool hadPreloadedDb = (cts3dDb_ != nullptr);
+  if (!hadPreloadedDb) {
+    cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
+  }
   cts3dDb_->populate();
 
   // JYJ (2026-02-09) Copy wire RC from TechChar to 3D database
@@ -103,6 +108,30 @@ void TritonCTS::runTritonCts()
   const double wire_cap = techChar_->getCapPerDBU();
   cts3dDb_->setWireRC(0, wire_res, wire_cap);  // bottom tier
   cts3dDb_->setWireRC(1, wire_res, wire_cap);  // upper tier
+
+  // JYJ (2026-02-23) V32a: Auto-detect bottom/upper buffer pair from buf_list.
+  // When buf_list contains cells from different technology nodes (e.g., NG45
+  // "BUF_X4_bottom" and ASAP7 "BUF_X4_upper"), suffix substitution alone in
+  // getBufferForTier() fails.  Register an explicit pair so that the correct
+  // cell is selected for each tier during tree building.
+  {
+    // Lambda to check string suffix (hasSuffix is private in Cts3DDatabase)
+    auto hasSfx = [](const std::string& s, const std::string& sfx) {
+      return s.size() >= sfx.size()
+             && s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0;
+    };
+    std::string bottomBuf, upperBuf;
+    for (const auto& buf : options_->getBufferList()) {
+      if (hasSfx(buf, "_bottom")) {
+        bottomBuf = buf;
+      } else if (hasSfx(buf, "_upper")) {
+        upperBuf = buf;
+      }
+    }
+    if (!bottomBuf.empty() && !upperBuf.empty()) {
+      cts3dDb_->setTierBufferPair(bottomBuf, upperBuf);
+    }
+  }
 
   findClockRoots();
   populateTritonCTS();
@@ -121,7 +150,10 @@ void TritonCTS::runTritonCts()
 
   // reset
   techChar_.reset();
-  cts3dDb_.reset();  // JYJ (2026-02-06) Cleanup 3D tier database
+  // JYJ (2026-02-21) Only reset 3D DB if no pre-loaded skew targets
+  if (!cts3dDb_ || !cts3dDb_->hasSkewTargets()) {
+    cts3dDb_.reset();  // JYJ (2026-02-06) Cleanup 3D tier database
+  }
   builders_.clear();
   staClockNets_.clear();
   visitedClockNets_.clear();
@@ -2070,11 +2102,43 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
 
 void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
 {
+  // V49-diag: scan for duplicate names in clockBuffers_ deque
+  {
+    std::unordered_map<std::string, int> nameCounts;
+    clockNet.forEachClockBuffer([&](const ClockInst& inst) {
+      nameCounts[inst.getName()]++;
+    });
+    for (const auto& [name, count] : nameCounts) {
+      if (count > 1) {
+        logger_->warn(CTS, 497,
+            "V49-diag: buffer '{}' appears {} times in clockBuffers_ deque",
+            name, count);
+      }
+    }
+    // Also check if any buffer name already exists as ODB instance
+    clockNet.forEachClockBuffer([&](const ClockInst& inst) {
+      odb::dbInst* existing = block_->findInst(inst.getName().c_str());
+      if (existing) {
+        logger_->warn(CTS, 496,
+            "V49-diag: buffer '{}' already exists in ODB BEFORE createClockBuffers "
+            "(master={})",
+            inst.getName(), existing->getMaster()->getName());
+      }
+    });
+  }
+
   unsigned numBuffers = 0;
   clockNet.forEachClockBuffer([&](ClockInst& inst) {
     odb::dbMaster* master = db_->findMaster(inst.getMaster().c_str());
     odb::dbInst* newInst = odb::dbInst::create(
         block_, master, inst.getName().c_str(), false, parent);
+    // V49: null check to catch duplicate buffer names (dbInst::create
+    // returns nullptr when an instance with the same name already exists).
+    if (!newInst) {
+      logger_->error(CTS, 499,
+                     "Failed to create clock buffer '{}' — duplicate name?",
+                     inst.getName());
+    }
     newInst->setSourceType(odb::dbSourceType::TIMING);
     inst.setInstObj(newInst);
     inst2clkbuf_[newInst] = &inst;
@@ -2647,6 +2711,46 @@ void TritonCTS::extractFFGraphFromVerilog(const std::string& verilog_file,
   logger_->report("Verilog-based extraction complete!");
   logger_->report("Output written to: {}", output_file);
   logger_->report("==========================================");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JYJ (2026-02-21) Pre-CTS skew targets for SG-CTS
+// ─────────────────────────────────────────────────────────────────────────────
+void TritonCTS::loadSkewTargets(const std::string& csv_path)
+{
+  // Ensure cts3dDb_ exists (may be called before runTritonCts)
+  if (!cts3dDb_) {
+    cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
+    cts3dDb_->populate();
+  }
+  cts3dDb_->loadSkewTargets(csv_path);
+}
+
+// JYJ (2026-02-23) V32: Estimate per-FF physical achievability bounds for LP-SAFETY.
+// Uses ClockLatencyEstimator to compute t_via from HBT parasitic and writes
+// bounds CSV consumed by pre_cts_skew_lp.py via --bounds-csv argument.
+void TritonCTS::estimateLeafLatencies(const std::string& output_csv,
+                                       double max_skew_ns)
+{
+  // Ensure cts3dDb_ exists and is populated with tier info
+  if (!cts3dDb_) {
+    cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
+    cts3dDb_->populate();
+  }
+
+  // Load HB via parasitic from tech (set_layer_rc -via hb_layer in Tcl setup)
+  // Needed to compute t_via = 0.693 * R_HB * C_HB
+  cts3dDb_->loadHybridBondParasitics();
+
+  // Compute per-FF bounds and write CSV
+  ClockLatencyEstimator estimator(cts3dDb_.get());
+  estimator.estimateAndWrite(output_csv, max_skew_ns);
+
+  const double t_via_ps = estimator.getViaDelayNs() * 1.0e3;
+  logger_->report(
+      "estimate_leaf_latencies: t_via = {:.2f} ps, max_skew = {:.0f} ps, "
+      "written to {}",
+      t_via_ps, max_skew_ns * 1.0e3, output_csv);
 }
 
 }  // namespace cts

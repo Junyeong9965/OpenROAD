@@ -326,6 +326,11 @@ class Opendp
   int max_displacement_x_ = 0;  // sites
   int max_displacement_y_ = 0;  // sites
   bool disallow_one_site_gaps_ = false;
+
+  // 3D-aware DPL: cells on different tiers can share the same (x,y) site
+  bool enable_3d_dpl_ = false;
+  // Get tier from cell master name: *_bottom* -> 0, *_upper* -> 1, else -1
+  static int getCellTier(const Node* cell);
   std::vector<Node*> placement_failures_;
 
   // 2D pixel grid

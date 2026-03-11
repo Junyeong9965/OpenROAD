@@ -645,3 +645,42 @@ proc have_detailed_route { block } {
 
 # grt namespace end
 }
+
+# JYJ V41: Per-clock-subnet layer range for hold-aware routing
+sta::define_cmd_args "set_clock_subnet_layers" {
+  [-net net_name] [-min_layer layer_name] [-max_layer layer_name]
+}
+
+proc set_clock_subnet_layers { args } {
+  sta::parse_key_args "set_clock_subnet_layers" args \
+    keys {-net -min_layer -max_layer} flags {}
+
+  sta::check_argc_eq0 "set_clock_subnet_layers" $args
+
+  if { ![info exists keys(-net)] } {
+    utl::error GRT 351 "set_clock_subnet_layers requires -net argument."
+  }
+  if { ![info exists keys(-min_layer)] } {
+    utl::error GRT 352 "set_clock_subnet_layers requires -min_layer argument."
+  }
+  if { ![info exists keys(-max_layer)] } {
+    utl::error GRT 353 "set_clock_subnet_layers requires -max_layer argument."
+  }
+
+  set net_name $keys(-net)
+  set min_layer_name $keys(-min_layer)
+  set max_layer_name $keys(-max_layer)
+
+  set min_idx [grt::parse_layer_name $min_layer_name]
+  set max_idx [grt::parse_layer_name $max_layer_name]
+
+  grt::set_per_net_clock_layer_range $net_name $min_idx $max_idx
+}
+
+# JYJ V41: Clear all per-net clock layer range overrides
+sta::define_cmd_args "clear_clock_subnet_layers" {}
+
+proc clear_clock_subnet_layers { args } {
+  sta::check_argc_eq0 "clear_clock_subnet_layers" $args
+  grt::clear_per_net_clock_layer_ranges
+}

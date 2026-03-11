@@ -504,4 +504,23 @@ extract_ff_timing_graph_verilog(const char* verilog_file, const char* output_fil
 {
   getTritonCts()->extractFFGraphFromVerilog(verilog_file, output_file);
 }
+
+// JYJ (2026-02-21) Pre-CTS skew targets for SG-CTS
+void
+load_skew_targets(const char* csv_file)
+{
+  getTritonCts()->loadSkewTargets(csv_file);
+}
+
+// JYJ (2026-02-23) V32: Estimate per-FF physical achievability bounds.
+// Computes HB via delay (t_via = 0.693 * R_HB * C_HB) from tech and writes
+// bounds CSV for the LP-SAFETY pre-CTS skew solver (pre_cts_skew_lp.py).
+// output_csv:  destination path (ff_name,tier,t_min_ns,t_max_ns)
+// max_skew_ns: same-tier CTS delay budget in ns (default 0.1 = 100ps)
+void
+estimate_leaf_latencies(const char* output_csv, float max_skew_ns)
+{
+  getTritonCts()->estimateLeafLatencies(output_csv, max_skew_ns);
+}
+
 %} //inline

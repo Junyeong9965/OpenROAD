@@ -138,6 +138,10 @@ class GlobalRouter
   void setMaxLayerForClock(int max_layer);
   int getMinLayerForClock();
   int getMaxLayerForClock();
+  // JYJ V41: Per-clock-subnet layer range override for hold-aware routing
+  void setPerNetClockLayerRange(odb::dbNet* net, int min_layer, int max_layer);
+  void clearPerNetClockLayerRanges();
+  int getPerNetClockLayerRangeCount() const;
   void setCriticalNetsPercentage(float critical_nets_percentage);
   void addLayerAdjustment(int layer, float reduction_percentage);
   void addRegionAdjustment(int min_x,
@@ -530,6 +534,10 @@ class GlobalRouter
 
   // Region adjustment variables
   std::vector<RegionAdjustment> region_adjustments_;
+
+  // JYJ V41: Per-clock-subnet layer range override map
+  // Maps clock net -> (min_layer, max_layer) for hold-aware routing
+  std::unordered_map<odb::dbNet*, std::pair<int,int>> per_net_clock_layer_range_;
 
   bool verbose_;
 

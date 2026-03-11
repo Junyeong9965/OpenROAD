@@ -18,6 +18,7 @@ add_library(cts_lib
     CtsOptions.cpp
     VerilogFFExtractor.cpp
     Cts3DDatabase.cpp  # JYJ (2026-02-06) Added 3D tier database
+    ClockLatencyEstimator.cpp  # JYJ (2026-02-23) V32: per-FF physical achievability estimator
 )
 
 swig_lib(NAME      cts

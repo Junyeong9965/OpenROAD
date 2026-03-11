@@ -99,7 +99,10 @@ void GuiChart::setXAxisFormat(const std::string& format)
 
 void GuiChart::setYAxisFormats(const std::vector<std::string>& formats)
 {
-  assert(formats.size() == series_.size());
+  // JYJ (2026-02-11) Guard against size mismatch instead of crashing
+  if (formats.size() != series_.size()) {
+    return;
+  }
   for (int i = 0; i < formats.size(); ++i) {
     if (!formats[i].empty()) {
       Series& series = series_[i];
@@ -110,7 +113,10 @@ void GuiChart::setYAxisFormats(const std::vector<std::string>& formats)
 
 void GuiChart::setYAxisMin(const std::vector<std::optional<double>>& mins)
 {
-  assert(mins.size() == series_.size());
+  // JYJ (2026-02-11) Guard against size mismatch instead of crashing
+  if (mins.size() != series_.size()) {
+    return;
+  }
   for (int i = 0; i < mins.size(); ++i) {
     const std::optional<double>& min = mins[i];
     if (min) {

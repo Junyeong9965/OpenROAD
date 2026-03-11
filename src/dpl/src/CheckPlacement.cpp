@@ -378,6 +378,15 @@ bool Opendp::overlap(const Node* cell1, const Node* cell2) const
     return false;
   }
 
+  // 3D-aware DPL: cells on different tiers don't overlap in 3D
+  if (enable_3d_dpl_) {
+    const int tier1 = getCellTier(cell1);
+    const int tier2 = getCellTier(cell2);
+    if (tier1 >= 0 && tier2 >= 0 && tier1 != tier2) {
+      return false;
+    }
+  }
+
   const DbuPt ll1 = initialLocation(cell1, false);
   const DbuPt ll2 = initialLocation(cell2, false);
   DbuPt ur1, ur2;
@@ -389,6 +398,8 @@ bool Opendp::overlap(const Node* cell1, const Node* cell2) const
 Node* Opendp::checkOneSiteGaps(Node& cell) const
 {
   Node* gap_cell = nullptr;
+  // 3D-aware DPL: get tier of cell being checked
+  const int my_tier = enable_3d_dpl_ ? getCellTier(&cell) : -1;
   grid_->visitCellBoundaryPixels(
       cell, [&](Pixel* pixel, const Direction2D& edge, GridX x, GridY y) {
         GridX abut_x{0};
@@ -406,11 +417,23 @@ Node* Opendp::checkOneSiteGaps(Node& cell) const
         }
         // check the abutting pixel
         const Pixel* abut_pixel = grid_->gridPixel(x + abut_x, y);
-        const bool abuttment_exists = (abut_pixel && abut_pixel->cell);
+        // 3D-aware: different-tier cell in abutting pixel counts as abutment
+        bool abuttment_exists = (abut_pixel && abut_pixel->cell);
+        if (enable_3d_dpl_ && abuttment_exists && my_tier >= 0
+            && abut_pixel->cell_tier >= 0
+            && my_tier != abut_pixel->cell_tier) {
+          abuttment_exists = false;  // different tier — not real abutment
+        }
         if (!abuttment_exists) {
           // check the 1 site gap pixel
           const Pixel* gap_pixel = grid_->gridPixel(x + GridX{2 * abut_x.v}, y);
-          if (gap_pixel) {
+          if (gap_pixel && gap_pixel->cell) {
+            // 3D-aware: skip gap violation if gap cell is on different tier
+            if (enable_3d_dpl_ && my_tier >= 0
+                && gap_pixel->cell_tier >= 0
+                && my_tier != gap_pixel->cell_tier) {
+              return;  // different tier — not a real one-site gap
+            }
             gap_cell = gap_pixel->cell;
           }
         }

@@ -39,6 +39,7 @@ struct Sink
   const float x, y;
   int cluster_idx{-1};
   const unsigned sink_idx;  // index in sinks_
+  float target{0.0f};       // JYJ V40: LP skew target (ns)
 };
 
 Clustering::Clustering(const std::vector<std::pair<float, float>>& sinks,
@@ -147,6 +148,31 @@ float Clustering::Kmeans(const unsigned n,
     sink.cluster_idx = -1;
   }
 
+  // JYJ V41-fix BUG#7: Seed per-cluster mean targets from nearest sinks.
+  // V40 used uniform avgT for all clusters → first iteration was target-blind.
+  // Now assign each sink to its nearest initial mean (by position), then compute
+  // per-cluster mean target from those nearest sinks.
+  if (targetBeta_ > 0.0f) {
+    meanTargets_.resize(n, 0.0f);
+    std::vector<float> sumT(n, 0.0f);
+    std::vector<int> cntT(n, 0);
+    for (const auto& s : sinks_) {
+      // Find nearest cluster center (by pure position)
+      float bestDist = FLT_MAX;
+      unsigned bestC = 0;
+      for (unsigned c = 0; c < n; ++c) {
+        float d = std::abs(means[c].first - s.x)
+                + std::abs(means[c].second - s.y);
+        if (d < bestDist) { bestDist = d; bestC = c; }
+      }
+      sumT[bestC] += s.target;
+      cntT[bestC]++;
+    }
+    for (unsigned c = 0; c < n; ++c) {
+      meanTargets_[c] = (cntT[c] > 0) ? sumT[c] / cntT[c] : 0.0f;
+    }
+  }
+
   std::vector<std::vector<Sink*>> clusters;
   bool stop = false;
   // Kmeans optimization
@@ -175,7 +201,7 @@ float Clustering::Kmeans(const unsigned n,
         for (size_t j = 0; j < means.size(); ++j) {
           if (clusters[j].size() < cap) {
             minimumDist = calcDist(
-                std::make_pair(means[j].first, means[j].second), &sink);
+                std::make_pair(means[j].first, means[j].second), j, &sink);
             minimumDistClusterIndex = j;
             break;
           }
@@ -189,7 +215,7 @@ float Clustering::Kmeans(const unsigned n,
           for (size_t j = 0; j < means.size(); ++j) {
             if (clusters[j].size() < cap) {
               const float currentDist = calcDist(
-                  std::make_pair(means[j].first, means[j].second), &sink);
+                  std::make_pair(means[j].first, means[j].second), j, &sink);
               if (currentDist < minimumDist) {
                 minimumDist = currentDist;
                 minimumDistClusterIndex = j;
@@ -223,6 +249,18 @@ float Clustering::Kmeans(const unsigned n,
       }
     }
 
+    // JYJ V40: Update per-cluster mean targets after means recomputation
+    if (targetBeta_ > 0.0f) {
+      meanTargets_.resize(n, 0.0f);
+      for (unsigned i = 0; i < n; ++i) {
+        float sum_t = 0.0f;
+        for (const auto* s : clusters[i])
+          sum_t += s->target;
+        if (!clusters[i].empty())
+          meanTargets_[i] = sum_t / clusters[i].size();
+      }
+    }
+
     clusters_ = clusters;
 
     if (iter > max || delta < 0.5) {
@@ -246,10 +284,10 @@ float Clustering::calcSilh(
       const float y = means[j].second;
       if (sink.cluster_idx == j) {
         // within the cluster
-        in_d = calcDist({x, y}, &sink);
+        in_d = calcDist({x, y}, j, &sink);
       } else {
         // outside of the cluster
-        const float d = calcDist({x, y}, &sink);
+        const float d = calcDist({x, y}, j, &sink);
         out_d = std::min(d, out_d);
       }
     }
@@ -306,7 +344,7 @@ void Clustering::minCostFlow(const std::vector<std::pair<float, float>>& means,
   std::vector<double> costs;
   for (size_t i = 0; i < sinks_.size(); ++i) {
     for (size_t j = 0; j < means.size(); ++j) {
-      double d = calcDist(means[j], &sinks_[i]);
+      double d = calcDist(means[j], j, &sinks_[i]);
       if (d <= dist) {
         d = std::pow(d, power);
         if (d < std::numeric_limits<int>::max()) {
@@ -416,10 +454,26 @@ void Clustering::getClusters(
   }
 }
 
-/* static */
-float Clustering::calcDist(const std::pair<float, float>& loc, const Sink* sink)
+// JYJ (2026-02-26) V40: Set per-sink LP targets for target-aware clustering.
+void Clustering::setSinkTargets(const std::vector<float>& targets, float beta)
 {
-  return calcDist(loc, {sink->x, sink->y});
+  targetBeta_ = beta;
+  for (size_t i = 0; i < sinks_.size() && i < targets.size(); ++i) {
+    sinks_[i].target = targets[i];
+  }
+}
+
+// JYJ V40: Target-aware distance. Adds target penalty when targetBeta_ > 0.
+float Clustering::calcDist(const std::pair<float, float>& loc,
+                           size_t clusterIdx,
+                           const Sink* sink) const
+{
+  float d = std::abs(loc.first - sink->x)
+            + std::abs(loc.second - sink->y);
+  if (targetBeta_ > 0.0f && clusterIdx < meanTargets_.size()) {
+    d += targetBeta_ * std::abs(meanTargets_[clusterIdx] - sink->target);
+  }
+  return d;
 }
 
 /* static */

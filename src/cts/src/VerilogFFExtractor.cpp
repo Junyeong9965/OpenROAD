@@ -272,11 +272,12 @@ void VerilogFFExtractor::fillLocations(FFEdgeVerilog& edge)
     edge.from_x = x;
     edge.from_y = y;
     // JYJ (2026-02-06) Replaced master name parsing with Cts3DDatabase query
+    // JYJ (2026-02-11) Fix fallback: master names use "_upper" not "__upper"
     if (cts3dDb_) {
       edge.from_tier = cts3dDb_->getInstTier(from_inst);
     } else {
       std::string master = from_inst->getMaster()->getName();
-      edge.from_tier = (master.find("__upper") != std::string::npos) ? 1 : 0;
+      edge.from_tier = (master.find("_upper") != std::string::npos) ? 1 : 0;
     }
   }
 
@@ -286,11 +287,12 @@ void VerilogFFExtractor::fillLocations(FFEdgeVerilog& edge)
     edge.to_x = x;
     edge.to_y = y;
     // JYJ (2026-02-06) Replaced master name parsing with Cts3DDatabase query
+    // JYJ (2026-02-11) Fix fallback: master names use "_upper" not "__upper"
     if (cts3dDb_) {
       edge.to_tier = cts3dDb_->getInstTier(to_inst);
     } else {
       std::string master = to_inst->getMaster()->getName();
-      edge.to_tier = (master.find("__upper") != std::string::npos) ? 1 : 0;
+      edge.to_tier = (master.find("_upper") != std::string::npos) ? 1 : 0;
     }
   }
 }

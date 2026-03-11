@@ -307,6 +307,32 @@ float estimate_path_resistance(odb::dbObject* pin1,
     pin1, pin2, layer1, layer2, verbose);
 }
 
+// JYJ V41: Per-clock-subnet layer range override for hold-aware routing
+void
+set_per_net_clock_layer_range(const char* net_name, int min_layer, int max_layer)
+{
+  auto* block = ord::OpenRoad::openRoad()->getDb()->getChip()->getBlock();
+  auto* db_net = block->findNet(net_name);
+  if (db_net == nullptr) {
+    ord::OpenRoad::openRoad()->getLogger()->warn(
+        utl::GRT, 350, "Net {} not found for per-net clock layer range.", net_name);
+    return;
+  }
+  getGlobalRouter()->setPerNetClockLayerRange(db_net, min_layer, max_layer);
+}
+
+void
+clear_per_net_clock_layer_ranges()
+{
+  getGlobalRouter()->clearPerNetClockLayerRanges();
+}
+
+int
+get_per_net_clock_layer_range_count()
+{
+  return getGlobalRouter()->getPerNetClockLayerRangeCount();
+}
+
 } // namespace
 
 %} // inline

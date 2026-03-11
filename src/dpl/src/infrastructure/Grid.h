@@ -46,6 +46,9 @@ struct Pixel
   uint8_t blocked_layers = 0;
   // Cell that reserved this pixel for padding
   Node* padding_reserved_by = nullptr;
+  // 3D-aware DPL: tier of the cell occupying this pixel
+  // -1 = unknown/unset, 0 = bottom, 1 = upper
+  int cell_tier = -1;
 };
 
 // Return value for grid searches.

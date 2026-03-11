@@ -1421,6 +1421,21 @@ void GlobalRouter::getNetLayerRange(odb::dbNet* db_net,
                                     int& min_layer,
                                     int& max_layer)
 {
+  // JYJ V41: Check per-net clock layer range override first
+  auto it = per_net_clock_layer_range_.find(db_net);
+  if (it != per_net_clock_layer_range_.end()) {
+    min_layer = it->second.first;
+    max_layer = it->second.second;
+    // Still respect pin connection layer minimum
+    Net* net = db_net_map_[db_net];
+    int pin_min_layer = std::numeric_limits<int>::max();
+    for (const Pin& pin : net->getPins()) {
+      pin_min_layer = std::min(pin_min_layer, pin.getConnectionLayer());
+    }
+    min_layer = std::max(min_layer, pin_min_layer);
+    return;
+  }
+
   Net* net = db_net_map_[db_net];
   int pin_min_layer = std::numeric_limits<int>::max();
   for (const Pin& pin : net->getPins()) {
@@ -2046,6 +2061,23 @@ void GlobalRouter::setMaxLayerForClock(const int max_layer)
     block_ = db_->getChip()->getBlock();
   }
   block_->setMaxLayerForClock(max_layer);
+}
+
+// JYJ V41: Per-clock-subnet layer range override for hold-aware routing
+void GlobalRouter::setPerNetClockLayerRange(odb::dbNet* net,
+                                            int min_layer, int max_layer)
+{
+  per_net_clock_layer_range_[net] = {min_layer, max_layer};
+}
+
+void GlobalRouter::clearPerNetClockLayerRanges()
+{
+  per_net_clock_layer_range_.clear();
+}
+
+int GlobalRouter::getPerNetClockLayerRangeCount() const
+{
+  return static_cast<int>(per_net_clock_layer_range_.size());
 }
 
 void GlobalRouter::setCriticalNetsPercentage(float critical_nets_percentage)

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -81,6 +82,7 @@ void Grid::allocateGrid()
       pixel.is_valid = false;
       pixel.is_hopeless = false;
       pixel.blocked_layers = 0;
+      pixel.cell_tier = -1;
     }
   }
 
@@ -433,6 +435,7 @@ void Grid::erasePixel(Node* cell)
       if (pixel->cell == cell) {
         pixel->cell = nullptr;
         pixel->util = 0;
+        pixel->cell_tier = -1;
       }
 
       // Clear padding reservations made by this cell
@@ -450,6 +453,16 @@ void Grid::paintPixel(Node* cell, GridX grid_x, GridY grid_y)
   GridY cell_y_end = gridEndY(gridYToDbu(grid_y) + cell->getHeight());
 
   // Mark actual cell pixels
+  // 3D-aware DPL: determine tier from cell master name
+  int paint_tier = -1;
+  if (cell && cell->getDbInst()) {
+    const char* mname = cell->getDbInst()->getMaster()->getConstName();
+    if (std::strstr(mname, "bottom")) {
+      paint_tier = 0;
+    } else if (std::strstr(mname, "upper")) {
+      paint_tier = 1;
+    }
+  }
   for (GridX x{grid_x}; x < cell_x_end; x++) {
     for (GridY y{grid_y}; y < cell_y_end; y++) {
       Pixel* pixel = gridPixel(x, y);
@@ -458,6 +471,7 @@ void Grid::paintPixel(Node* cell, GridX grid_x, GridY grid_y)
       }
       pixel->cell = cell;
       pixel->util = 1.0;
+      pixel->cell_tier = paint_tier;
     }
   }
 

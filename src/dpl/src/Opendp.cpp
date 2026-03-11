@@ -29,6 +29,9 @@
 #include "util/journal.h"
 #include "utl/Logger.h"
 
+#include <cstdlib>   // std::getenv
+#include <cstring>   // std::strstr
+
 namespace dpl {
 
 using std::round;
@@ -108,6 +111,16 @@ void Opendp::detailedPlacement(const int max_displacement_x,
 {
   importDb();
   adjustNodesOrient();
+
+  // 3D-aware DPL: read env var to enable tier-aware overlap checking
+  // When enabled, cells on different tiers (bottom/upper) can share
+  // the same (x,y) site without being considered overlapping.
+  const char* env_3d_dpl = std::getenv("CTS_ENABLE_3D_DPL");
+  enable_3d_dpl_ = (env_3d_dpl && std::string(env_3d_dpl) == "1");
+  if (enable_3d_dpl_) {
+    logger_->info(DPL, 57, "3D-aware DPL enabled: cross-tier overlap allowed.");
+  }
+
   for (const auto& node : network_->getNodes()) {
     if (node->getType() == Node::CELL && !node->isFixed()) {
       node->setPlaced(false);
@@ -296,10 +309,31 @@ void Opendp::setGridCell(Node& cell, Pixel* pixel)
 {
   pixel->cell = &cell;
   pixel->util = 1.0;
+  // 3D-aware DPL: record tier of the cell occupying this pixel
+  if (enable_3d_dpl_) {
+    pixel->cell_tier = getCellTier(&cell);
+  }
   if (cell.isBlock()) {
     // Try the is_hopeless strategy to get off of a block
     pixel->is_hopeless = true;
   }
+}
+
+// Determine cell tier from master name suffix:
+//   *bottom* -> tier 0, *upper* -> tier 1, else -1
+int Opendp::getCellTier(const Node* cell)
+{
+  if (!cell || !cell->getDbInst()) {
+    return -1;
+  }
+  const char* master_name = cell->getDbInst()->getMaster()->getConstName();
+  if (std::strstr(master_name, "bottom")) {
+    return 0;
+  }
+  if (std::strstr(master_name, "upper")) {
+    return 1;
+  }
+  return -1;
 }
 
 void Opendp::groupAssignCellRegions()

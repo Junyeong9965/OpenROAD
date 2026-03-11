@@ -725,14 +725,15 @@ void InitFloorplan::makeUniformRows(odb::dbSite* base_site,
   };
   for (const auto& [name, site] : sites_by_name) {
     if (site->getHeight() % base_site->getHeight() != 0) {
-      logger_->error(
+      logger_->warn(
           IFP,
           54,
-          "Site {} height {}um is not a multiple of site {} height {}um.",
+          "Site {} height {}um is not a multiple of site {} height {}um. Skipping rows for this site.",
           site->getName(),
           block_->dbuToMicrons(site->getHeight()),
           base_site->getName(),
           block_->dbuToMicrons(base_site->getHeight()));
+      continue;
     }
     make_rows(site);
   }
@@ -1161,14 +1162,15 @@ void InitFloorplan::makePolygonRowsScanline(
     // For each site type, create polygon-aware rows
     for (const auto& [name, site] : sites_by_name) {
       if (site->getHeight() % base_site->getHeight() != 0) {
-        logger_->error(
+        logger_->warn(
             IFP,
             1001,
-            "Site {} height {}um is not a multiple of site {} height {}um.",
+            "Site {} height {}um is not a multiple of site {} height {}um. Skipping rows for this site.",
             site->getName(),
             block_->dbuToMicrons(site->getHeight()),
             base_site->getName(),
             block_->dbuToMicrons(base_site->getHeight()));
+        continue;
       }
       makeUniformRowsPolygon(
           site, core_polygon, snapped_bbox, row_parity, flipped_sites);
