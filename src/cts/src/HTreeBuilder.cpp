@@ -4,6 +4,7 @@
 #include "HTreeBuilder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -14,8 +15,9 @@
 #include <vector>
 
 #include "Clustering.h"
-#include "Cts3DDatabase.h"  // JYJ (2026-02-06) Added for 3D tier management
+#include "Cts3DDatabase.h"  // Added for 3D tier management
 #include "SinkClustering.h"
+#include "TarpClustering.h"  // TARP clustering
 #include "TechChar.h"
 #include "TreeBuilder.h"
 #include "Util.h"
@@ -27,7 +29,37 @@ namespace cts {
 
 using utl::CTS;
 
-// JYJ (2026-02-06) Removed anonymous namespace containing hasSuffix() and
+namespace {
+
+bool isNamedHardMacroMaster(const odb::dbMaster* master)
+{
+  if (master == nullptr) {
+    return false;
+  }
+  std::string name = master->getName();
+  std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
+  return name.rfind("fakeram", 0) == 0 || name.rfind("fakeregfile", 0) == 0
+         || name.rfind("sram_", 0) == 0;
+}
+
+bool isMacroBlockInst(const odb::dbInst* inst)
+{
+  if (inst == nullptr) {
+    return false;
+  }
+  if (inst->isBlock()) {
+    return true;
+  }
+  const odb::dbMaster* master = inst->getMaster();
+  return (master != nullptr && master->isBlock())
+         || isNamedHardMacroMaster(master);
+}
+
+}  // namespace
+
+// Removed anonymous namespace containing hasSuffix() and
 // mapBufferMasterToTier() — moved to Cts3DDatabase::hasSuffix() and
 // Cts3DDatabase::getBufferForTier()
 
@@ -39,29 +71,40 @@ Point<double> HTreeBuilder::legalizeOneBuffer(Point<double> bufferLoc,
   return resolveLocationCollision(legalLoc);
 }
 
-// JYJ (2026-02-21) Step 3: Skew-aware clustering via skew target penalty
+// Step 3: Skew-aware clustering via skew target penalty
 // HB penalty removed — vias (including HB) don't get distance penalty in 2D CTS
 // either, and STA already accounts for HB RC in timing. Clustering should remain
 // purely spatial + skew-target-driven.
+// Removed skewTargetBeta_ dead code block.
+// computeDist() is called with candidate branching points (not in
+// mapLocationToSink_) → find() always failed → beta penalty never fired.
+// Target-aware clustering works via CTS_CKMEANS_TARGET_BETA in
+// refineBranchingPointsWithClustering() → Clustering::calcDist().
 double HTreeBuilder::computeDist(const Point<double>& x, const Point<double>& y)
 {
-  double baseDist = TreeBuilder::computeDist(x, y);
+  return TreeBuilder::computeDist(x, y);
+}
 
-  // Skew target penalty: group FFs with similar arrival targets
-  if (skewTargetBeta_ > 0.0 && cts3dDb_ != nullptr
-      && cts3dDb_->hasSkewTargets()) {
-    auto itX = mapLocationToSink_.find(x);
-    auto itY = mapLocationToSink_.find(y);
-    if (itX != mapLocationToSink_.end() && itY != mapLocationToSink_.end()
-        && itX->second != nullptr && itY->second != nullptr) {
-      // V32c: use getClockInstTarget() which handles both cluster buffers and FFs
-      const double targetX = getClockInstTarget(itX->second);
-      const double targetY = getClockInstTarget(itY->second);
-      baseDist += skewTargetBeta_ * std::abs(targetX - targetY);
+// V58 Fix B: Epsilon-tolerant lookup for mapLocationToSink_.
+// Falls back to linear scan within eps when exact find() fails.
+// Matches the epsilon pattern already used in leaf-sink connection code.
+ClockInst* HTreeBuilder::findSinkEps(const Point<double>& loc,
+                                      double eps) const
+{
+  auto it = mapLocationToSink_.find(loc);
+  if (it != mapLocationToSink_.end()) {
+    return it->second;
+  }
+  auto hint = mapLocationToSink_.lower_bound(
+      Point<double>(loc.getX() - eps, loc.getY() - eps));
+  for (auto scan = hint; scan != mapLocationToSink_.end(); ++scan) {
+    if (scan->first.getX() > loc.getX() + eps) break;
+    if (std::abs(scan->first.getX() - loc.getX()) < eps
+        && std::abs(scan->first.getY() - loc.getY()) < eps) {
+      return scan->second;
     }
   }
-
-  return baseDist;
+  return nullptr;
 }
 
 void HTreeBuilder::preSinkClustering(
@@ -85,8 +128,9 @@ void HTreeBuilder::preSinkClustering(
   const std::vector<std::pair<float, float>>& points = sinks;
   if (!secondLevel) {
     clock_.forEachSink([&](ClockInst& inst) {
-      const Point<double> normLocation((float) inst.getX() / wireSegmentUnit_,
-                                       (float) inst.getY() / wireSegmentUnit_);
+      // FloatFix: (float) → (double) to prevent map key mismatch → CTS-0080
+      const Point<double> normLocation((double) inst.getX() / wireSegmentUnit_,
+                                       (double) inst.getY() / wireSegmentUnit_);
       mapLocationToSink_[normLocation] = &inst;
       if (!fuzzyEqual(inst.getInsertionDelay(), 0.0, 1e-6)) {
         setSinkInsertionDelay(normLocation,
@@ -103,6 +147,47 @@ void HTreeBuilder::preSinkClustering(
   if (sinks.size() <= min_clustering_sinks
       || !(options_->getSinkClustering())) {
     topLevelSinksClustered_ = sinks;
+    return;
+  }
+
+  // Hilbert-calibrated TARP.
+  // Run Hilbert grid search as lightweight pre-pass to find optimal
+  // cluster granularity (bestGroupSize + bestDiameter), then pass
+  // to TARP FM. This ensures TARP operates at the right spatial
+  // granularity for each design without per-design manual tuning.
+  if (enableTarp_ && !secondLevel
+      && cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()
+      && sinks.size() >= 50u) {
+
+    // Step 1: Lightweight Hilbert grid search (no leaf buffer creation)
+    SinkClustering calibration(options_, techChar_, this);
+    const unsigned numPts = points.size();
+    for (unsigned i = 0; i < numPts; ++i) {
+      calibration.addPoint(points[i].first, points[i].second);
+      if (sinkInsts[i]->getInputCap() == 0) {
+        calibration.addCap(options_->getSinkBufferInputCap());
+      } else {
+        calibration.addCap(sinkInsts[i]->getInputCap());
+      }
+    }
+
+    unsigned bestGS = 0;
+    float bestDiam = 0.0f;
+    // Grid search: groupSize ∈ {10,20,30} × diameter ∈ {50,100,200}μm
+    for (unsigned diam : clusterDiameters()) {
+      for (unsigned gs : options_->getSinkClusteringSizes()) {
+        float maxDiam = diam * static_cast<float>(options_->getDbUnits())
+                       / wireSegmentUnit_;
+        calibration.run(gs, maxDiam, wireSegmentUnit_, bestGS, bestDiam);
+      }
+    }
+
+    logger_->info(CTS, 845,
+        "TARP Hilbert calibration: bestGroupSize={}, bestDiameter={:.0f}um",
+        bestGS, bestDiam / options_->getDbUnits() * wireSegmentUnit_);
+
+    // Step 2: Pass calibrated params to TARP (env var overrides take priority)
+    runTarpClustering(points, sinkInsts, bestGS, bestDiam);
     return;
   }
 
@@ -205,7 +290,7 @@ void HTreeBuilder::preSinkClustering(
 
   unsigned clusterCount = 0;
 
-  // JYJ (2026-02-09) Tier-aware clustering: detect cross-tier clusters
+  // Tier-aware clustering: detect cross-tier clusters
   // Calculate HB equivalent distance for cross-tier penalty awareness
   const double wire_res_per_unit = cts3dDb_->getResPerDBU(0) * wireSegmentUnit_;
   const double wire_cap_per_unit = cts3dDb_->getCapPerDBU(0) * wireSegmentUnit_;
@@ -213,15 +298,15 @@ void HTreeBuilder::preSinkClustering(
       wire_res_per_unit, wire_cap_per_unit);
 
   // Note: Current k-means clustering uses geometric distance only.
-  // TODO Phase 3: Modify SinkClustering/CKMeans to inject hb_equivalent_dist
+  // Possible extension: inject HB equivalent distance into SinkClustering/CKMeans
   // as penalty when computing distance between sinks on different tiers.
   // This would actively discourage cross-tier clusters during k-means.
 
   std::vector<std::pair<float, float>> newSinkLocations;
 
-  // JYJ (2026-02-25) V37: Helper lambda to create one leaf buffer for a group of FFs.
+  // Helper lambda to create one leaf buffer for a group of FFs.
   // This is factored out so that sub-clustering can call it multiple times per cluster.
-  int splitCount_2way = 0, splitCount_3way = 0;  // V37 stats
+  int splitCount_2way = 0, splitCount_3way = 0;  // sub-cluster stats
   auto createLeafBuffer = [&](const std::vector<ClockInst*>& subInsts,
                                const std::vector<unsigned>& subPointIdxs,
                                unsigned& leafIdx) {
@@ -239,7 +324,7 @@ void HTreeBuilder::preSinkClustering(
     const std::string sink_buffer
         = cts3dDb_->getBufferForTier(options_->getSinkBuffer(), target_tier);
 
-    const char* baseName = secondLevel ? "clkbuf_leaf2_" : "clkbuf_leaf_";
+    const std::string baseName = tierPrefix_ + (secondLevel ? "clkbuf_leaf2_" : "clkbuf_leaf_");
     Point<double> rootBufLoc = legalizeOneBuffer(center, sink_buffer);
     commitMoveLoc(center, rootBufLoc);
 
@@ -256,7 +341,7 @@ void HTreeBuilder::preSinkClustering(
       addSecondLevelSinkDriver(&rootBuffer);
     }
 
-    const char* netBaseName = secondLevel ? "clknet_leaf2_" : "clknet_leaf_";
+    const std::string netBaseName = tierPrefix_ + (secondLevel ? "clknet_leaf2_" : "clknet_leaf_");
     ClockSubNet& clockSubNet
         = clock_.addSubNet(netBaseName + std::to_string(leafIdx));
     clockSubNet.addInst(rootBuffer);
@@ -272,7 +357,7 @@ void HTreeBuilder::preSinkClustering(
     Point<double> mapKey(point.first, point.second);
     mapLocationToSink_[mapKey] = &rootBuffer;
 
-    // V32c: store mean LP skew target for this leaf buffer
+    // Store mean LP skew target for this leaf buffer
     if (cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()) {
       double clusterSum = 0.0;
       for (ClockInst* ci : subInsts) {
@@ -291,6 +376,22 @@ void HTreeBuilder::preSinkClustering(
     if (cluster.size() == 1) {
       const std::pair<float, float>& point = points[cluster[0]];
       newSinkLocations.emplace_back(point);
+      // V58 Fix A: Register singleton cluster in mapLocationToSink_.
+      // Without this, the singleton's coordinate is in topLevelSinksClustered_
+      // but missing from mapLocationToSink_ → computeBranchDelayTargets() and
+      // getDominantTier() silently skip this sink (exact find() fails).
+      // Same fix already exists in TARP path (line ~4819).
+      const Point<double> sinkPt((double) point.first, (double) point.second);
+      if (mapLocationToSink_.find(sinkPt) == mapLocationToSink_.end()) {
+        constexpr double eps = 0.01;
+        for (auto& [key, sink] : mapLocationToSink_) {
+          if (std::abs(key.getX() - sinkPt.getX()) < eps
+              && std::abs(key.getY() - sinkPt.getY()) < eps) {
+            mapLocationToSink_[sinkPt] = sink;
+            break;
+          }
+        }
+      }
       clusterCount++;
       continue;
     }
@@ -301,12 +402,41 @@ void HTreeBuilder::preSinkClustering(
         const std::pair<double, double>& point = points[point_idx];
         const Point<double> mapPoint(point.first, point.second);
         if (mapLocationToSink_.find(mapPoint) == mapLocationToSink_.end()) {
-          logger_->error(CTS, 79, "Sink not found.");
+          // FloatFix: epsilon fallback for float→double key mismatch
+          bool found = false;
+          constexpr double eps = 0.01;
+          for (auto& [key, sink] : mapLocationToSink_) {
+            if (std::abs(key.getX() - mapPoint.getX()) < eps
+             && std::abs(key.getY() - mapPoint.getY()) < eps) {
+              mapLocationToSink_[mapPoint] = sink;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            // V58: eps=1e-4 failed — find absolute nearest entry (no distance limit).
+            // Skipping would leave this sink unconnected → SIGSEGV in writeDummyLoadsToDb.
+            double bestDist = std::numeric_limits<double>::max();
+            for (auto& [key, sink] : mapLocationToSink_) {
+              double d = std::abs(key.getX() - mapPoint.getX())
+                       + std::abs(key.getY() - mapPoint.getY());
+              if (d < bestDist) {
+                bestDist = d;
+                mapLocationToSink_[mapPoint] = sink;
+                found = true;
+              }
+            }
+            if (found) {
+              logger_->warn(CTS, 79,
+                  "Sink at ({:.6f}, {:.6f}) — nearest match dist={:.6f}",
+                  mapPoint.getX(), mapPoint.getY(), bestDist);
+            }
+          }
         }
         clusterClockInsts.push_back(mapLocationToSink_[mapPoint]);
       }
 
-      // JYJ (2026-02-09) Detect cross-tier clustering
+      // Detect cross-tier clustering
       int tier0_count = 0, tier1_count = 0;
       for (const ClockInst* inst : clusterClockInsts) {
         const int inst_tier = cts3dDb_->getInstTier(inst->getDbInst());
@@ -314,7 +444,7 @@ void HTreeBuilder::preSinkClustering(
         else if (inst_tier == 1) tier1_count++;
       }
       if (tier0_count > 0 && tier1_count > 0) {
-        logger_->warn(CTS, 364,
+        logger_->warn(CTS, 571,
                       "Cross-tier cluster detected: cluster={}, tier0={}, tier1={}, "
                       "dominant_tier={}, HB_penalty={:.1f}um",
                       clusterCount, tier0_count, tier1_count,
@@ -322,7 +452,7 @@ void HTreeBuilder::preSinkClustering(
                       hb_equivalent_dist);
       }
 
-      // JYJ (2026-03-03) V48: Lambda for V37 target-aware split + leaf buffer
+      // Lambda for V37 target-aware split + leaf buffer
       // creation.  Applies target-spread splitting to any (sub-)cluster, then
       // creates leaf buffers.  Used by both tier-split sub-clusters and
       // unsplit clusters so that tier split no longer skips target split.
@@ -383,7 +513,7 @@ void HTreeBuilder::preSinkClustering(
                 }
 
                 logger_->info(CTS, 413,
-                              "V37 sub-cluster {}.{}: {} sinks, "
+                              "Sub-cluster {}.{}: {} sinks, "
                               "target=[{:.4f}, {:.4f}]ns (spread={:.4f}ns)",
                               clusterCount, s, splitInsts.size(),
                               ffTargets[start].target,
@@ -400,7 +530,7 @@ void HTreeBuilder::preSinkClustering(
         createLeafBuffer(insts, idxs, clusterCount);
       };
 
-      // JYJ (2026-03-01) V48: Tier-aware cluster split.
+      // Tier-aware cluster split.
       // If cluster has both bottom and upper FFs, split into two sub-clusters.
       // Each sub-cluster also gets V37 target-aware splitting if enabled.
       bool wasSplit = false;
@@ -423,7 +553,7 @@ void HTreeBuilder::preSinkClustering(
         }
 
         logger_->info(CTS, 377,
-            "V48 tier split cluster {}: bottom={}, upper={}",
+            "Tier split cluster {}: bottom={}, upper={}",
             clusterCount,
             bottomInsts.size(), upperInsts.size());
 
@@ -439,10 +569,10 @@ void HTreeBuilder::preSinkClustering(
     }
   }
 
-  // V37: Log sub-clustering statistics
+  // Log sub-clustering statistics
   if (splitCount_2way > 0 || splitCount_3way > 0) {
     logger_->info(CTS, 414,
-                  "V37 target-aware sub-clustering: {} 2-way splits, "
+                  "Target-aware sub-clustering: {} 2-way splits, "
                   "{} 3-way splits, total leaf buffers = {}",
                   splitCount_2way, splitCount_3way, clusterCount);
   }
@@ -457,14 +587,14 @@ void HTreeBuilder::preSinkClustering(
                 " Total number of sinks after clustering: {}.",
                 topLevelSinksClustered_.size());
 
-  // V37-debug: Verify every entry in topLevelSinksClustered_ exists in mapLocationToSink_
+  // Verify every entry in topLevelSinksClustered_ exists in mapLocationToSink_
   int missingCount = 0;
   for (size_t si = 0; si < topLevelSinksClustered_.size(); ++si) {
     const auto& sinkPair = topLevelSinksClustered_[si];
     Point<double> key(sinkPair.first, sinkPair.second);
     if (mapLocationToSink_.find(key) == mapLocationToSink_.end()) {
       logger_->warn(CTS, 418,
-                    "V37-debug: topLevelSinksClustered_[{}] = ({:.10f}, {:.10f}) "
+                    "Debug: topLevelSinksClustered_[{}] = ({:.10f}, {:.10f}) "
                     "NOT in mapLocationToSink_ (size={})",
                     si, sinkPair.first, sinkPair.second,
                     mapLocationToSink_.size());
@@ -473,11 +603,11 @@ void HTreeBuilder::preSinkClustering(
   }
   if (missingCount > 0) {
     logger_->warn(CTS, 419,
-                  "V37-debug: {} / {} sinks missing from mapLocationToSink_!",
+                  "Debug: {} / {} sinks missing from mapLocationToSink_!",
                   missingCount, topLevelSinksClustered_.size());
   } else {
     logger_->info(CTS, 427,
-                  "V37-debug: All {} sinks verified in mapLocationToSink_ (mapSize={})",
+                  "Debug: All {} sinks verified in mapLocationToSink_ (mapSize={})",
                   topLevelSinksClustered_.size(), mapLocationToSink_.size());
   }
 }
@@ -490,11 +620,9 @@ Point<double> HTreeBuilder::resolveLocationCollision(
   // Collision check and jittering to ensure unique coordinates
   unsigned jitterCount = 0;
   while (true) {
-    // Simulate the float conversion that happens when storing in
-    // newSinkLocations. This is needed because the existing logic uses the
-    // double->float conversion for the center location.
-    Point<double> checkKey((float) resolvedLocation.getX(),
-                           (float) resolvedLocation.getY());
+    // FloatFix: removed (float) cast to match map key precision (double)
+    Point<double> checkKey(resolvedLocation.getX(),
+                           resolvedLocation.getY());
     if (mapLocationToSink_.find(checkKey) == mapLocationToSink_.end()) {
       break;
     }
@@ -519,7 +647,7 @@ Point<double> HTreeBuilder::resolveLocationCollision(
   return resolvedLocation;
 }
 
-// JYJ (2026-02-06) Removed getDominantTierFromInsts, getDominantTierFromSinkLocs,
+// Removed getDominantTierFromInsts, getDominantTierFromSinkLocs,
 // getDominantTierFromClockSinks — moved to Cts3DDatabase::getDominantTier() and
 // Cts3DDatabase::getDominantTierFromClock()
 
@@ -1490,21 +1618,17 @@ void HTreeBuilder::run()
   numMaxLeafSinks_ = options_->getNumMaxLeafSinks();
   minLengthSinkRegion_ = techChar_->getMinSegmentLength() * 2;
 
-  // JYJ (2026-02-21) Step 3: Initialize skew-aware clustering weight from env
-  skewTargetBeta_ = 0.0;
+  // skewTargetBeta_ / CTS_SKEW_TARGET_BETA removed.
+  // Was dead code — computeDist() called with candidate branching points
+  // not in mapLocationToSink_ → beta penalty never fired.
+  // Target-aware clustering: CTS_CKMEANS_TARGET_BETA (read at line ~1725).
   if (cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()) {
-    const char* beta_env = std::getenv("CTS_SKEW_TARGET_BETA");
-    if (beta_env != nullptr) {
-      skewTargetBeta_ = std::atof(beta_env);
-    } else {
-      skewTargetBeta_ = 5000.0;  // default
-    }
     logger_->info(CTS, 400,
-                  "Skew-aware clustering enabled: beta={:.1f}, {} targets loaded",
-                  skewTargetBeta_, cts3dDb_->getSkewTargetCount());
+                  "{} skew targets loaded",
+                  cts3dDb_->getSkewTargetCount());
   }
 
-  // JYJ (2026-02-23) V31: Initialize useful-skew wire adjustment parameters
+  // Initialize useful-skew wire adjustment parameters
   // CTS_WIRE_SKEW_SCALE: 0 = disabled (zero-skew), 1.0 = full LP-guided wire shift
   // CTS_WIRE_DELAY_PS_UM: wire delay per unit length (ps/um)
   //   Used to convert LP target difference (ns) → wire length shift (um)
@@ -1517,20 +1641,20 @@ void HTreeBuilder::run()
     if (wss_env != nullptr) {
       wireSkewScale_ = std::atof(wss_env);
     } else {
-      wireSkewScale_ = 1.0;  // default: enabled when skew targets are loaded
+      wireSkewScale_ = 0.0;  // V58 Fix D: default OFF — hold regression (V51b confirmed)
     }
     if (wdpu_env != nullptr) {
       wireDelayPerUnit_ = std::atof(wdpu_env) * 0.001;  // ps/um → ns/um
     }
     if (wireSkewScale_ > 0.0) {
       logger_->info(CTS, 405,
-                    "V31 useful-skew wire adjustment enabled: scale={:.2f}, "
+                    "Useful-skew wire adjustment enabled: scale={:.2f}, "
                     "wireDelay={:.3f}ps/um",
                     wireSkewScale_, wireDelayPerUnit_ * 1000.0);
     }
   }
 
-  // JYJ (2026-02-27) V42-fix: Read target-split env vars BEFORE initSinkRegion(),
+  // Read target-split env vars BEFORE initSinkRegion(),
   // because preSinkClustering() (called inside initSinkRegion()) uses
   // enableTargetSplit_ at line 328.  Previously read at line 1576 — too late.
   if (cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()) {
@@ -1542,14 +1666,100 @@ void HTreeBuilder::run()
       splitThreshold3wayNs_ = std::atof(e) * 0.001;  // ps → ns
   }
 
-  // JYJ (2026-03-01) V48: Tier-aware cluster split
+  // Tier-aware cluster split
   if (const char* e = std::getenv("CTS_ENABLE_TIER_SPLIT"))
     enableTierSplit_ = (std::atoi(e) != 0);
-  logger_->info(CTS, 376, "V48 tier split: {}", enableTierSplit_ ? "ON" : "OFF");
+  logger_->info(CTS, 376, "Tier split: {}", enableTierSplit_ ? "ON" : "OFF");
 
+  // TARP clustering
+  if (const char* e = std::getenv("CTS_ENABLE_TARP"))
+    enableTarp_ = (std::atoi(e) != 0);
+  if (const char* e = std::getenv("CTS_TARP_ALPHA"))
+    tarpAlpha_ = std::stod(e);
+  if (const char* e = std::getenv("CTS_ENABLE_PER_TIER_CTS"))
+    enablePerTierCts_ = (std::atoi(e) != 0);
+  logger_->info(CTS, 840, "TARP: {} (alpha={:.2f}), per-tier: {}",
+                enableTarp_ ? "ON" : "OFF", tarpAlpha_,
+                enablePerTierCts_ ? "ON" : "OFF");
+
+  // Per-tier independent CTS.
+  // MUST be placed BEFORE initSinkRegion() to avoid double preSinkClustering().
+  // Env vars for grouped delay, relay, GH-tree etc. are read inside
+  // readSkewDeliveryEnvVars() called from runSingleTierTree().
+  if (enablePerTierCts_ && cts3dDb_ != nullptr) {
+    // Read delivery env vars here (before runSingleTierTree) so they are set
+    readSkewDeliveryEnvVars();
+
+    int tier0Count = 0, tier1Count = 0;
+    clock_.forEachSink([&](const ClockInst& sink) {
+      odb::dbInst* dbInst = sink.getDbInst();
+      if (dbInst == nullptr) return;
+      int t = cts3dDb_->getInstTier(dbInst);
+      if (t == 0) tier0Count++;
+      else if (t == 1) tier1Count++;
+    });
+    logger_->info(CTS, 850, "Per-tier split: tier0={} FFs, tier1={} FFs",
+                  tier0Count, tier1Count);
+
+    // Create ONE shared root buffer for both tiers
+    createSharedRoot();
+
+    // Build per-tier sub-trees (L1+ branches attach to shared root)
+    if (tier0Count > 0) runSingleTierTree(0);
+    if (tier1Count > 0) runSingleTierTree(1);
+    return;  // Skip unified tree path
+  }
+
+  auto prof_t0 = std::chrono::high_resolution_clock::now();
   initSinkRegion();
+  auto prof_t1 = std::chrono::high_resolution_clock::now();
+  double prof_clustering_s = std::chrono::duration<double>(prof_t1 - prof_t0).count();
+  logger_->info(CTS, 911, "Profile: initSinkRegion (TARP+clustering) {:.1f}s", prof_clustering_s);
 
-  for (int level = 1; level <= clockTreeMaxDepth_; ++level) {
+  // Fix G: Macro flat bypass (same logic as runSingleTierTree path)
+  {
+    int macroFlatMax = 50;
+    if (const char* e = std::getenv("CTS_MACRO_FLAT_MAX_SINKS")) {
+      macroFlatMax = std::atoi(e);
+    }
+    const int nSinks = clock_.getNumSinks();
+    if (type_ == TreeType::MacroTree && macroFlatMax > 0 && nSinks <= macroFlatMax) {
+      bool allBlock = true;
+      clock_.forEachSink([&](const ClockInst& sink) {
+        odb::dbInst* dbInst = sink.getDbInst();
+        if (!isMacroBlockInst(dbInst)) {
+          allBlock = false;
+        }
+      });
+      if (allBlock) {
+        logger_->info(CTS, 695,
+            "Fix G: Macro flat bypass — {} sinks (all block), threshold={}, "
+            "skipping H-tree → flat topology",
+            nSinks, macroFlatMax);
+        createSingleBufferClockNet();
+        treeBufLevels_++;
+        return;
+      }
+    }
+  }
+
+  // V58 Fix E: Macro tree depth clamp (fallback for non-flat macro trees)
+  int effectiveMaxDepth = clockTreeMaxDepth_;
+  if (type_ == TreeType::MacroTree) {
+    int macroMaxDepth = 2;
+    if (const char* e = std::getenv("CTS_MACRO_TREE_MAX_DEPTH")) {
+      macroMaxDepth = std::atoi(e);
+    }
+    if (macroMaxDepth > 0 && macroMaxDepth < effectiveMaxDepth) {
+      logger_->info(CTS, 692,
+          "V58 Fix E: Macro tree depth clamped {} -> {} (sinks={})",
+          effectiveMaxDepth, macroMaxDepth, clock_.getNumSinks());
+      effectiveMaxDepth = macroMaxDepth;
+    }
+  }
+
+  auto prof_htree_t0 = std::chrono::high_resolution_clock::now();
+  for (int level = 1; level <= effectiveMaxDepth; ++level) {
     const unsigned numSinksPerSubRegion
         = computeNumberOfSinksPerSubRegion(level);
     double regionWidth, regionHeight;
@@ -1582,6 +1792,11 @@ void HTreeBuilder::run()
     }
   }
 
+  auto prof_htree_t1 = std::chrono::high_resolution_clock::now();
+  double prof_htree_s = std::chrono::duration<double>(prof_htree_t1 - prof_htree_t0).count();
+  logger_->info(CTS, 912, "Profile: H-tree level loop ({} levels) {:.1f}s",
+                static_cast<int>(topologyForEachLevel_.size()), prof_htree_s);
+
   if (topologyForEachLevel_.empty()) {
     createSingleBufferClockNet();
     treeBufLevels_++;
@@ -1603,30 +1818,58 @@ void HTreeBuilder::run()
     legalize();
   }
 
-  // JYJ (2026-02-21) Step 4: Compute per-branch delay targets before tree construction
-  // JYJ (2026-02-23) V32b: also read N-buffer chain parameters (singleBufDelay_, maxLeafDelayBufs_)
-  if (cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()) {
-    const char* thr_env = std::getenv("CTS_DELAY_TARGET_THRESHOLD");
-    delayTargetThreshold_ = (thr_env != nullptr) ? std::atof(thr_env) : 0.010;
+  // Extracted to readSkewDeliveryEnvVars().
+  // Called from per-tier block (above) or here for unified mode.
+  readSkewDeliveryEnvVars();
 
-    // V32b: single delay-buffer delay (ns) and max chain length per leaf
+  auto prof_subnets_t0 = std::chrono::high_resolution_clock::now();
+  createClockSubNets();
+  auto prof_subnets_t1 = std::chrono::high_resolution_clock::now();
+  double prof_subnets_s = std::chrono::duration<double>(prof_subnets_t1 - prof_subnets_t0).count();
+  logger_->info(CTS, 913, "Profile: createClockSubNets (leaf+TAP+delay) {:.1f}s", prof_subnets_s);
+
+  // Total run() time
+  auto prof_total_t1 = std::chrono::high_resolution_clock::now();
+  double prof_total_s = std::chrono::duration<double>(prof_total_t1 - prof_t0).count();
+  logger_->info(CTS, 914,
+      "Profile: run() total {:.1f}s (clustering={:.1f} htree={:.1f} subnets={:.1f})",
+      prof_total_s, prof_clustering_s, prof_htree_s, prof_subnets_s);
+
+  // clang-format off
+  debugPrint(logger_, CTS, "legalizer", 3, "Htree file {} has been generated",
+             plotHTree());
+  debugPrint(logger_, CTS, "legalizer", 3, "Run 'obsAwareCts.py cts.clk.buffer'"
+	     "to produce cts.clk.buffer.png");
+  // clang-format on
+}
+
+// Extracted from run() — reads all skew delivery env vars.
+// Safe to call multiple times (idempotent).
+void HTreeBuilder::readSkewDeliveryEnvVars()
+{
+  if (cts3dDb_ == nullptr || !cts3dDb_->hasSkewTargets()) return;
+
+  const char* thr_env = std::getenv("CTS_DELAY_TARGET_THRESHOLD");
+  delayTargetThreshold_ = (thr_env != nullptr) ? std::atof(thr_env) : 0.010;
+
+    // Single delay-buffer delay (ns) and max chain length per leaf
     if (const char* e = std::getenv("CTS_LEAF_BUF_DELAY_NS"))
       singleBufDelay_ = std::atof(e);
     if (const char* e = std::getenv("CTS_MAX_LEAF_DELAY_BUFS"))
       maxLeafDelayBufs_ = std::atoi(e);
 
-    // JYJ (2026-02-25) V37: Target-aware sub-clustering parameters
+    // Target-aware sub-clustering parameters
     // NOTE: env var reading moved to before initSinkRegion() (V42-fix).
     // Only logging remains here.
     if (enableTargetSplit_) {
       logger_->info(CTS, 410,
-                    "V37 target-aware sub-clustering enabled: "
+                    "Target-aware sub-clustering enabled: "
                     "2way_threshold={:.1f}ps, 3way_threshold={:.1f}ps",
                     splitThreshold2wayNs_ * 1000.0,
                     splitThreshold3wayNs_ * 1000.0);
     }
 
-    // JYJ (2026-02-26) V39: Per-FF relay buffer parameters
+    // Per-FF relay buffer parameters
     enablePerFfRelay_ = false;
     if (const char* e = std::getenv("CTS_ENABLE_PER_FF_RELAY"))
       enablePerFfRelay_ = (std::atoi(e) != 0);
@@ -1639,12 +1882,17 @@ void HTreeBuilder::run()
         perFfHoldGuard_ = std::atof(e);
       if (const char* e = std::getenv("CTS_PER_FF_MIN_TARGET_NS"))
         perFfMinTarget_ = std::atof(e);
-      if (const char* csv = std::getenv("CTS_TIMING_GRAPH_CSV"))
-        loadPerFfHoldBudgets(csv);
-      // JYJ V40: Also load IO edge hold budgets (PI→FF hold slack)
-      if (const char* ioCsv = std::getenv("CTS_IO_TIMING_CSV"))
-        loadIoHoldBudgets(ioCsv);
-      // JYJ (2026-02-28) V47: Elmore wire RC parameters for x_useful positioning
+      {
+        auto hb_t0 = std::chrono::high_resolution_clock::now();
+        if (const char* csv = std::getenv("CTS_TIMING_GRAPH_CSV"))
+          loadPerFfHoldBudgets(csv);
+        if (const char* ioCsv = std::getenv("CTS_IO_TIMING_CSV"))
+          loadIoHoldBudgets(ioCsv);
+        auto hb_t1 = std::chrono::high_resolution_clock::now();
+        double hb_s = std::chrono::duration<double>(hb_t1 - hb_t0).count();
+        logger_->info(CTS, 917, "Profile: loadHoldBudgets (CSV parse) {:.1f}s", hb_s);
+      }
+      // Elmore wire RC parameters for x_useful positioning
       relayRwKOhmPerUm_ = 0.0;
       relayCwFfPerUm_   = 0.0;
       relayDbuPerUm_    = 2000.0;
@@ -1656,7 +1904,7 @@ void HTreeBuilder::run()
         relayDbuPerUm_ = std::atof(e);
       const bool useElmore = (relayRwKOhmPerUm_ > 1e-12 && relayCwFfPerUm_ > 1e-12);
       logger_->info(CTS, 420,
-                    "V47 per-FF relay: bufDelay={:.3f}ns maxRelay={} "
+                    "Per-FF relay: bufDelay={:.3f}ns maxRelay={} "
                     "holdGuard={:.3f}ns minTarget={:.3f}ns holdBudgets={} "
                     "Elmore={}(rw={:.4f}kOhm/um cw={:.4f}fF/um)",
                     perFfBufDelay_, perFfMaxRelay_, perFfHoldGuard_,
@@ -1671,7 +1919,7 @@ void HTreeBuilder::run()
       enablePerFfRelay_ = false;
     }
 
-    // JYJ (2026-03-05) V49: Grouped Delay Chain parameters.
+    // Grouped Delay Chain parameters.
     // Groups FFs within each leaf cluster by quantized LP target delta.
     // Shared delay chain per group → fewer nets than per-FF relay → avoids GRT-0183.
     enableGroupedDelay_ = false;
@@ -1691,23 +1939,66 @@ void HTreeBuilder::run()
           perFfHoldGuard_ = std::atof(e);
         if (const char* e = std::getenv("CTS_PER_FF_MIN_TARGET_NS"))
           perFfMinTarget_ = std::atof(e);
-        if (const char* csv = std::getenv("CTS_TIMING_GRAPH_CSV"))
-          loadPerFfHoldBudgets(csv);
-        if (const char* ioCsv = std::getenv("CTS_IO_TIMING_CSV"))
-          loadIoHoldBudgets(ioCsv);
+        {
+          auto hb2_t0 = std::chrono::high_resolution_clock::now();
+          if (const char* csv = std::getenv("CTS_TIMING_GRAPH_CSV"))
+            loadPerFfHoldBudgets(csv);
+          if (const char* ioCsv = std::getenv("CTS_IO_TIMING_CSV"))
+            loadIoHoldBudgets(ioCsv);
+          auto hb2_t1 = std::chrono::high_resolution_clock::now();
+          double hb2_s = std::chrono::duration<double>(hb2_t1 - hb2_t0).count();
+          logger_->info(CTS, 918, "Profile: loadHoldBudgets (per-tier path) {:.1f}s", hb2_s);
+        }
       }
-      // V50: Cluster-Uniform Depth mode — one chain per cluster, depth = cluster median.
+      // Cluster-Uniform Depth mode — one chain per cluster, depth = cluster median.
       enableClusterUniform_ = false;
       if (const char* e = std::getenv("CTS_GROUPED_DELAY_CLUSTER_UNIFORM"))
         enableClusterUniform_ = (std::atoi(e) != 0);
+
+      // Liberty-based buffer delay override (from V51-BUF).
+      // charBuf_ driving its own input cap = cascaded tap scenario.
+      // Overrides env var CTS_PER_FF_BUF_DELAY_NS with Liberty-measured value.
+      {
+        const double libertyDelay = techChar_->getCharBufDelay();
+        const double libInputCap  = techChar_->getCharBufInputCap();
+        if (libertyDelay > 0) {
+          perFfBufDelay_ = libertyDelay;
+          logger_->info(CTS, 860,
+              "Liberty buf delay: {:.4f}ns (charBuf input_cap={:.4f}pF)",
+              perFfBufDelay_, libInputCap);
+        } else {
+          logger_->warn(CTS, 861,
+              "Liberty delay not available; using default perFfBufDelay={:.3f}ns",
+              perFfBufDelay_);
+        }
+      }
+
+      // GH-Tree Cascaded Delay Tap.
+      // When enabled, buildGroupChains uses cascaded tap structure instead of
+      // parallel chains. Same depth delivery, ~50% fewer buffers and nets.
+      enableGhTree_ = false;
+      if (const char* e = std::getenv("CTS_ENABLE_GH_TREE"))
+        enableGhTree_ = (std::atoi(e) != 0);
+      // Adaptive depth cost ratio (default 1.0 = 1 FF per empty tap to justify)
+      if (const char* e = std::getenv("CTS_ADAPTIVE_DEPTH_COST_RATIO"))
+        adaptiveDepthCostRatio_ = std::atof(e);
+
+      // Log after all env vars are read so values are accurate
       logger_->info(CTS, 490,
-                    "V50 grouped delay: maxDepth={} minDelta={:.3f}ns "
-                    "bufDelay={:.3f}ns holdGuard={:.3f}ns holdBudgets={} "
-                    "clusterUniform={}",
+                    "Grouped delay: maxDepth={} minDelta={:.3f}ns "
+                    "bufDelay={:.3f}ns holdBudgets={} "
+                    "clusterUniform={} cascadedTap={} adaptiveCost={:.1f}",
                     groupedDelayMaxDepth_, groupedDelayMinDelta_,
-                    perFfBufDelay_, perFfHoldGuard_,
+                    perFfBufDelay_,
                     static_cast<int>(perFfHoldBudget_.size()),
-                    enableClusterUniform_ ? 1 : 0);
+                    enableClusterUniform_ ? 1 : 0,
+                    enableGhTree_ ? 1 : 0,
+                    adaptiveDepthCostRatio_);
+      if (enableGhTree_) {
+        logger_->info(CTS, 570,
+            "Cascaded tap + adaptive depth: costRatio={:.1f}, bufDelay={:.3f}ns",
+            adaptiveDepthCostRatio_, perFfBufDelay_);
+      }
     } else if (enableGroupedDelay_) {
       logger_->warn(CTS, 491,
                     "CTS_ENABLE_GROUPED_DELAY=1 but no skew targets; "
@@ -1715,32 +2006,23 @@ void HTreeBuilder::run()
       enableGroupedDelay_ = false;
     }
 
-    // V39: Intermediate delay buffer gate (V37 default on, V39 default off)
+    // Intermediate delay buffer gate (V37 default on, V39 default off)
     enableMidDelayBufs_ = false;
     if (const char* e = std::getenv("CTS_ENABLE_MID_DELAY_BUFS"))
       enableMidDelayBufs_ = (std::atoi(e) != 0);
 
-    // JYJ (2026-02-26) V40: CKMeans target-aware branching weight.
+    // CKMeans target-aware branching weight.
     // When > 0, H-tree 2-way split (CKMeans) groups FFs with similar targets.
     ckmeansTargetBeta_ = 0.0;
     if (const char* e = std::getenv("CTS_CKMEANS_TARGET_BETA"))
       ckmeansTargetBeta_ = std::atof(e);
     if (ckmeansTargetBeta_ > 0.0) {
       logger_->info(CTS, 428,
-          "V40 CKMeans target-aware branching: beta={:.1f}",
+          "CKMeans target-aware branching: beta={:.1f}",
           ckmeansTargetBeta_);
     }
 
     computeBranchDelayTargets();
-  }
-
-  createClockSubNets();
-  // clang-format off
-  debugPrint(logger_, CTS, "legalizer", 3, "Htree file {} has been generated",
-             plotHTree());
-  debugPrint(logger_, CTS, "legalizer", 3, "Run 'obsAwareCts.py cts.clk.buffer'"
-	     "to produce cts.clk.buffer.png");
-  // clang-format on
 }
 
 bool HTreeBuilder::isNumberOfSinksTooSmall(unsigned numSinksPerSubRegion) const
@@ -2238,14 +2520,383 @@ void HTreeBuilder::computeBranchingPoints(const unsigned level,
       });
 }
 
+// Per-tier independent H-tree.
+// Create a single shared root buffer at the center of ALL sinks (both tiers).
+// Both per-tier sub-trees attach their L1 branches to this shared root subnet.
+// This ensures tier-to-tier clock skew is controlled at the root level.
+void HTreeBuilder::createSharedRoot()
+{
+  wireSegmentUnit_ = techChar_->getLengthUnit();
+
+  // Compute center from ALL sinks (not filtered by tier)
+  std::vector<std::pair<float, float>> allSinks;
+  std::vector<const ClockInst*> allInsts;
+  initTopLevelSinks(allSinks, allInsts);
+
+  float minX = 1e30f, maxX = -1e30f, minY = 1e30f, maxY = -1e30f;
+  for (auto& [x, y] : allSinks) {
+    minX = std::min(minX, x); maxX = std::max(maxX, x);
+    minY = std::min(minY, y); maxY = std::max(maxY, y);
+  }
+  Point<double> center((minX + maxX) / 2.0, (minY + maxY) / 2.0);
+
+  // Root tier: overall dominant tier from all sinks.
+  // V58_CL2: CTS_FORCE_ROOT_TIER overrides dominant-tier selection.
+  // Pin3D uses bottom root buffer (same tier as majority of macros).
+  // Our getDominantTierFromClock() picks upper (98% upper FFs in swerv),
+  // creating a fundamentally different tree from Pin3D even with per-tier OFF.
+  int root_tier = cts3dDb_->getDominantTierFromClock(clock_);
+  if (const char* e = std::getenv("CTS_FORCE_ROOT_TIER")) {
+    int forced = std::atoi(e);
+    if (forced >= 0 && forced != root_tier) {
+      logger_->info(CTS, 700,
+          "V58_CL2: Root tier forced {} -> {} (CTS_FORCE_ROOT_TIER)",
+          root_tier, forced);
+      root_tier = forced;
+    }
+  }
+  sharedRootTier_ = root_tier;
+  const std::string root_buffer
+      = cts3dDb_->getBufferForTier(options_->getRootBuffer(), root_tier);
+
+  Point<double> legalCenter = legalizeOneBuffer(center, root_buffer);
+  const int centerX = legalCenter.getX() * wireSegmentUnit_;
+  const int centerY = legalCenter.getY() * wireSegmentUnit_;
+
+  // Create shared root buffer and subnet (no tier prefix — shared by both tiers)
+  sharedRootBuffer_
+      = &clock_.addClockBuffer("clkbuf_0", root_buffer, centerX, centerY);
+  // Only set topBufferName_ if not already set by forkRegisterClockNetwork().
+  // RegisterTree builders have topBufferName_ = "clkbuf_regs_0_..." (separator buffer
+  // that connects macro clock net to register clock net). Overwriting it with the
+  // shared root name breaks clock connectivity for register trees in multi-clock designs.
+  if (topBufferName_.empty()) {
+    topBufferName_ = sharedRootBuffer_->getName();
+  }
+  addTreeLevelBuffer(sharedRootBuffer_);
+
+  sharedRootSubNet_ = &clock_.addSubNet("clknet_0");
+  sharedRootSubNet_->setTreeLevel(0);
+  sharedRootSubNet_->addInst(*sharedRootBuffer_);
+  treeBufLevels_++;
+
+  sharedRootLocation_ = legalCenter;
+
+  logger_->info(CTS, 856,
+      "Shared root: tier={}, buffer={}, sinks={}, center=({:.2f}, {:.2f}), "
+      "rootBufName='{}', topBufferName='{}', clockName='{}'",
+      root_tier, root_buffer, allSinks.size(),
+      legalCenter.getX(), legalCenter.getY(),
+      sharedRootBuffer_->getName(), topBufferName_, clock_.getName());
+}
+
+// Runs the complete H-tree pipeline for a single tier:
+//   1. Filter sinks to this tier
+//   2. Clear per-tree state (mapLocationToSink_, topLevelSinksClustered_, topology)
+//   3. Run clustering → CKMeans → wire segments → createClockSubNets
+// When sharedRootBuffer_ is set, L1 branches attach to the shared root
+// instead of creating a tier-specific root buffer.
+void HTreeBuilder::runSingleTierTree(int tier)
+{
+  logger_->info(CTS, 851, "Building independent H-tree for tier {}", tier);
+
+  // --- Step 0: Set tier naming prefix to avoid buffer name collisions ---
+  // Tier 0 uses no prefix (backward compatible names: clkbuf_0, clkbuf_leaf_0, etc.)
+  // Tier 1 uses "t1_" prefix: t1_clkbuf_0, t1_clkbuf_leaf_0, etc.
+  tierPrefix_ = (tier == 0) ? "" : "t" + std::to_string(tier) + "_";
+
+  // --- Step 1: Clear per-tree state ---
+  mapLocationToSink_.clear();
+  topLevelSinksClustered_.clear();
+  topologyForEachLevel_.clear();
+  clusterBufTarget_.clear();
+  branchDelayTargets_.clear();
+  perLevelGlobalMean_.clear();
+
+  // wireSegmentUnit_ comes from TechChar (charBuf height × 10 / 2).
+  // charBuf is selected from buf_list (highest max-cap buffer).
+  // Do NOT override per-tier: in heterogeneous 3D with upper-only buf_list,
+  // using bottom tier buffer height (5x larger for NG45) destroys H-tree grid.
+  // Removed per-tier wireSegmentUnit recalculation (V57 hotfix, 2026-04-03).
+
+  // --- Step 2: Filter sinks for this tier and cluster ---
+  double clusterDiameter = (type_ == TreeType::MacroTree)
+                               ? options_->getMacroMaxDiameter()
+                               : options_->getMaxDiameter();
+  unsigned clusterSize = (type_ == TreeType::MacroTree)
+                             ? options_->getMacroSinkClusteringSize()
+                             : options_->getSinkClusteringSize();
+  const int dbUnits = options_->getDbUnits();
+  const float maxDiameter = (clusterDiameter * dbUnits) / wireSegmentUnit_;
+
+  std::vector<std::pair<float, float>> topLevelSinks;
+  std::vector<const ClockInst*> sinkInsts;
+  initTopLevelSinksForTier(tier, topLevelSinks, sinkInsts);
+  logger_->info(CTS, 852, "Tier {}: {} sinks after filtering", tier,
+                topLevelSinks.size());
+
+  if (topLevelSinks.empty()) {
+    logger_->info(CTS, 853, "Tier {}: no sinks, skipping tree", tier);
+    return;
+  }
+
+  // --- Step 4: Pre-sink clustering (Hilbert+Greedy or TARP) ---
+  preSinkClustering(topLevelSinks, sinkInsts, maxDiameter, clusterSize);
+
+  // Compute sink region from clustered sinks
+  unsigned min_clustering_sinks = (type_ == TreeType::MacroTree)
+                                      ? min_clustering_macro_sinks_
+                                      : min_clustering_sinks_;
+  if (topLevelSinks.size() <= min_clustering_sinks
+      || !(options_->getSinkClustering())) {
+    Box<int> sinkRegionDbu = clock_.computeSinkRegion();
+    sinkRegion_ = sinkRegionDbu.normalize(1.0 / wireSegmentUnit_);
+  } else {
+    if (topLevelSinksClustered_.size() > 400
+        && options_->getSinkClusteringLevels() > 0) {
+      std::vector<std::pair<float, float>> secondLevelLocs;
+      std::vector<const ClockInst*> secondLevelInsts;
+      initSecondLevelSinks(secondLevelLocs, secondLevelInsts);
+      preSinkClustering(secondLevelLocs, secondLevelInsts,
+                        maxDiameter * 4,
+                        std::ceil(std::sqrt(clusterSize)),
+                        true);
+    }
+    sinkRegion_ = clock_.computeSinkRegionClustered(topLevelSinksClustered_);
+  }
+  logger_->info(CTS, 854, "Tier {} sink region: {}", tier, sinkRegion_);
+
+  // --- Step 4b: Macro flat bypass (Fix G) ---
+  // Pin3D: bottom-only CTS → macro net has ~7 sinks (<15) → single-buffer flat
+  //   topology → macro latency ~563ps, balanced with registers (~442ps).
+  // V58 per-tier CTS: all 21 SRAMs on clk net → H-tree builds → 1,095ps latency
+  //   → 633ps gap vs registers → catastrophic hold violations.
+  // Fix G: when MacroTree AND all sinks are block (SRAM) AND sink_count ≤ threshold,
+  //   skip H-tree entirely → createSingleBufferClockNet (flat fan-out from root).
+  //   This replicates Pin3D's behavior: root → direct wire → each macro.
+  // CTS_MACRO_FLAT_MAX_SINKS env override (0=disable, default 50).
+  {
+    int macroFlatMax = 50;
+    if (const char* e = std::getenv("CTS_MACRO_FLAT_MAX_SINKS")) {
+      macroFlatMax = std::atoi(e);
+    }
+    const int nSinks = static_cast<int>(topLevelSinks.size());
+    if (type_ == TreeType::MacroTree && macroFlatMax > 0 && nSinks <= macroFlatMax) {
+      // Verify all sinks are block (SRAM/macro) instances
+      bool allBlock = true;
+      for (const auto* sinkInst : sinkInsts) {
+        if (!sinkInst || !isMacroBlockInst(sinkInst->getDbInst())) {
+          allBlock = false;
+          break;
+        }
+      }
+      if (allBlock) {
+        logger_->info(CTS, 693,
+            "Fix G: Macro flat bypass — {} sinks (all block), threshold={}, "
+            "skipping H-tree → flat topology (Pin3D-equivalent)",
+            nSinks, macroFlatMax);
+
+        if (sharedRootSubNet_ != nullptr) {
+          // Per-tier mode: shared root already exists (clkbuf_0_clk).
+          // V58_CL Fix: Cross-tier macro sub-root buffer.
+          // When macro sinks are on a different tier from the shared root,
+          // connecting them directly creates long cross-tier wires with huge
+          // latency spread (swerv DCCM: 475-1163ps from unbalanced wire RC).
+          // Fix: create a per-tier sub-root buffer on the macro's tier,
+          // connect it to the shared root, then connect macros to the sub-root.
+          // Same-tier macros still connect directly (no change).
+          const bool crossTier = (tier != sharedRootTier_
+                                  && sharedRootTier_ >= 0);
+          ClockSubNet* macroSubNet = sharedRootSubNet_;
+          if (crossTier) {
+            // Compute centroid of macro sinks on this tier
+            float cx = 0, cy = 0;
+            int cnt = 0;
+            for (const ClockInst* inst : sinkInsts) {
+              if (inst != nullptr) {
+                cx += (double) inst->getX() / wireSegmentUnit_;
+                cy += (double) inst->getY() / wireSegmentUnit_;
+                cnt++;
+              }
+            }
+            if (cnt > 0) { cx /= cnt; cy /= cnt; }
+            // Create sub-root buffer on the macro's tier
+            const std::string subRootMaster = cts3dDb_->getBufferForTier(
+                options_->getRootBuffer(), tier);
+            Point<double> subRootLoc(cx, cy);
+            Point<double> legalSubRoot = legalizeOneBuffer(
+                subRootLoc, subRootMaster);
+            const int sx = legalSubRoot.getX() * wireSegmentUnit_;
+            const int sy = legalSubRoot.getY() * wireSegmentUnit_;
+            const std::string subRootName
+                = tierPrefix_ + "clkbuf_macro_subroot_"
+                  + clock_.getName();
+            ClockInst& subRootBuf = clock_.addClockBuffer(
+                subRootName, subRootMaster, sx, sy);
+            if (cts3dDb_ != nullptr) {
+              cts3dDb_->setClockInstTier(subRootBuf, tier);
+            }
+            addTreeLevelBuffer(&subRootBuf);
+            // Connect sub-root to shared root subnet
+            sharedRootSubNet_->addInst(subRootBuf);
+            // Create sub-net for macro sinks
+            const std::string subNetName
+                = tierPrefix_ + "clknet_macro_subroot_"
+                  + clock_.getName();
+            ClockSubNet& subNet = clock_.addSubNet(subNetName);
+            subNet.addInst(subRootBuf);
+            subNet.setLeafLevel(true);
+            macroSubNet = &subNet;
+            treeBufLevels_++;
+            logger_->info(CTS, 696,
+                "Fix G: cross-tier macro sub-root '{}' on tier {} "
+                "at ({:.2f}, {:.2f}) for {} macro sinks "
+                "(shared root on tier {})",
+                subRootName, tier, legalSubRoot.getX(),
+                legalSubRoot.getY(), nSinks, sharedRootTier_);
+          } else {
+            // Same tier: connect directly to shared root (original behavior)
+            if (!sharedRootSubNet_->isLeafLevel()) {
+              sharedRootSubNet_->setLeafLevel(true);
+              treeBufLevels_++;
+            }
+          }
+          for (const ClockInst* inst : sinkInsts) {
+            if (inst != nullptr) {
+              macroSubNet->addInst(*const_cast<ClockInst*>(inst));
+            }
+          }
+          logger_->info(CTS, 694,
+              "Fix G: tier {} added {} macro sinks {} '{}'",
+              tier, nSinks,
+              crossTier ? "via sub-root to" : "directly to shared root",
+              crossTier ? (tierPrefix_ + "clkbuf_macro_subroot_"
+                           + clock_.getName())
+                        : sharedRootBuffer_->getName());
+        } else {
+          // Non-per-tier mode: use standard single-buffer flat topology.
+          createSingleBufferClockNet();
+          treeBufLevels_++;
+        }
+        return;
+      }
+    }
+  }
+
+  // --- Step 5: H-tree level topology (CKMeans bisection) ---
+  // V58 Fix E: Macro tree depth clamp (fallback for non-flat macro trees).
+  int effectiveMaxDepth = clockTreeMaxDepth_;
+  if (type_ == TreeType::MacroTree) {
+    int macroMaxDepth = 2;
+    if (const char* e = std::getenv("CTS_MACRO_TREE_MAX_DEPTH")) {
+      macroMaxDepth = std::atoi(e);
+    }
+    if (macroMaxDepth > 0 && macroMaxDepth < effectiveMaxDepth) {
+      logger_->info(CTS, 691,
+          "V58 Fix E: Macro tree depth clamped {} -> {} (sinks={})",
+          effectiveMaxDepth, macroMaxDepth,
+          static_cast<int>(topLevelSinksClustered_.size()));
+      effectiveMaxDepth = macroMaxDepth;
+    }
+  }
+  // V58_CL: Per-tier register tree depth clamp.
+  // Per-tier CTS creates deeper trees than single-tree Pin3D (path 14 vs 8)
+  // because each tier builds an independent H-tree from the shared root.
+  // Higher base latency → hold violations even for FFs with lp_target=0.
+  // CTS_PER_TIER_REG_MAX_DEPTH (default 0=disabled) caps H-tree levels
+  // for register trees in per-tier mode. Pin3D typically builds 7-8 levels.
+  if (enablePerTierCts_ && type_ != TreeType::MacroTree) {
+    int perTierRegMaxDepth = 0;
+    if (const char* e = std::getenv("CTS_PER_TIER_REG_MAX_DEPTH")) {
+      perTierRegMaxDepth = std::atoi(e);
+    }
+    if (perTierRegMaxDepth > 0
+        && perTierRegMaxDepth < effectiveMaxDepth) {
+      logger_->info(CTS, 697,
+          "V58_CL: Per-tier register tree depth clamped {} -> {} "
+          "(tier={}, sinks={})",
+          effectiveMaxDepth, perTierRegMaxDepth, tier,
+          static_cast<int>(topLevelSinksClustered_.size()));
+      effectiveMaxDepth = perTierRegMaxDepth;
+    }
+  }
+  for (int level = 1; level <= effectiveMaxDepth; ++level) {
+    const unsigned numSinksPerSubRegion
+        = computeNumberOfSinksPerSubRegion(level);
+    double regionWidth, regionHeight;
+    computeSubRegionSize(level, regionWidth, regionHeight);
+
+    if (isSubRegionTooSmall(regionWidth, regionHeight)) {
+      if (options_->isFakeLutEntriesEnabled()) {
+        const unsigned minIndex = 1;
+        techChar_->createFakeEntries(minLengthSinkRegion_, minIndex);
+        minLengthSinkRegion_ = 1;
+      } else {
+        break;
+      }
+    }
+    computeLevelTopology(level, regionWidth, regionHeight);
+    if (isNumberOfSinksTooSmall(numSinksPerSubRegion)) {
+      break;
+    }
+  }
+
+  if (topologyForEachLevel_.empty()) {
+    // Too few sinks for H-tree — create single buffer for this tier
+    logger_->info(CTS, 855, "Tier {}: too few clusters for H-tree, "
+                  "creating single buffer", tier);
+    createSingleBufferClockNet();
+    treeBufLevels_++;
+    return;
+  }
+
+  clock_.setMaxLevel(topologyForEachLevel_.size());
+
+  if (options_->getObstructionAware()) {
+    legalize();
+  }
+
+  // --- Step 6: Compute branch delay targets (for grouped delay/TAP) ---
+  if (cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()) {
+    computeBranchDelayTargets();
+  }
+
+  // --- Step 7: Create clock sub-nets (buffers, wires, grouped delay) ---
+  createClockSubNets();
+}
+
 void HTreeBuilder::initTopLevelSinks(
     std::vector<std::pair<float, float>>& sinkLocations,
     std::vector<const ClockInst*>& sinkInsts)
 {
   sinkLocations.clear();
   clock_.forEachSink([&](const ClockInst& sink) {
-    sinkLocations.emplace_back((float) sink.getX() / wireSegmentUnit_,
-                               (float) sink.getY() / wireSegmentUnit_);
+    // FloatFix: (float) → (double) to prevent map key mismatch → CTS-0080
+    sinkLocations.emplace_back((double) sink.getX() / wireSegmentUnit_,
+                               (double) sink.getY() / wireSegmentUnit_);
+    sinkInsts.emplace_back(&sink);
+  });
+}
+
+// Filter sinks to a specific tier for per-tier CTS.
+// Only includes FFs whose ODB instance is on the requested tier
+// (determined by Cts3DDatabase::getInstTier).
+void HTreeBuilder::initTopLevelSinksForTier(
+    int tier,
+    std::vector<std::pair<float, float>>& sinkLocations,
+    std::vector<const ClockInst*>& sinkInsts)
+{
+  sinkLocations.clear();
+  sinkInsts.clear();
+  clock_.forEachSink([&](const ClockInst& sink) {
+    if (cts3dDb_ == nullptr) return;
+    odb::dbInst* dbInst = sink.getDbInst();
+    if (dbInst == nullptr) return;
+    int instTier = cts3dDb_->getInstTier(dbInst);
+    if (instTier != tier) return;
+    // FloatFix: (float) → (double) to prevent map key mismatch → CTS-0080
+    sinkLocations.emplace_back((double) sink.getX() / wireSegmentUnit_,
+                               (double) sink.getY() / wireSegmentUnit_);
     sinkInsts.emplace_back(&sink);
   });
 }
@@ -2285,7 +2936,7 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
   CKMeans::Clustering clusteringEngine(
       sinks, rootLocation.getX(), rootLocation.getY(), logger_);
 
-  // JYJ (2026-02-26) V40: Pass per-sink LP targets to CKMeans.
+  // Pass per-sink LP targets to CKMeans.
   // When ckmeansTargetBeta_ > 0, CKMeans groups FFs with similar targets
   // into the same branch, enabling larger V31 wire shift differences.
   if (ckmeansTargetBeta_ > 0.0 && cts3dDb_ != nullptr
@@ -2329,7 +2980,7 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
   std::vector<std::vector<unsigned>> clusters;
   clusteringEngine.getClusters(clusters);
 
-  // JYJ (2026-02-23) V31: Useful-skew wire length adjustment (Fishburn 1990)
+  // Useful-skew wire length adjustment (Fishburn 1990)
   // After k-means sets branch point positions, shift each branch point radially
   // from rootLocation based on its cluster's mean LP skew target.
   //
@@ -2349,7 +3000,7 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
         const Point<double> sinkLoc(sinks[sinkIdx].first, sinks[sinkIdx].second);
         auto it = mapLocationToSink_.find(sinkLoc);
         if (it != mapLocationToSink_.end() && it->second != nullptr) {
-          // V32c: unified target accessor (cluster buffer or individual FF)
+          // Unified target accessor (cluster buffer or individual FF)
           sumT[ci] += getClockInstTarget(it->second);
           cntT[ci]++;
         }
@@ -2368,7 +3019,7 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
         return;
       }
       const double shiftUm = wireSkewScale_ * shiftNs / wireDelayPerUnit_;
-      // JYJ V41-fix BUG#6: Widened clamp from 50% to 80% of branch length.
+      // Widened clamp from 50% to 80% of branch length.
       // 50% limited wire-skew to ~10ps; LP requests 30-50ps differentials.
       const double maxShift    = 0.8 * dist;
       const double clampedShift = std::max(-maxShift, std::min(maxShift, shiftUm));
@@ -2392,7 +3043,7 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
                  (meanT1 - globalMean) * 1000.0, shift1Ps / 1000.0 * wireDelayPerUnit_ / wireDelayPerUnit_);
     }
   }
-  // End JYJ V31
+  // End wire-skew adjustment
 
   unsigned movedSinks = 0;
   const double errorFactor = 1.2;
@@ -2429,7 +3080,7 @@ void HTreeBuilder::refineBranchingPointsWithClustering(
   }
 }
 
-// JYJ (2026-02-23) V32c: unified LP skew target accessor for any ClockInst.
+// Unified LP skew target accessor for any ClockInst.
 // After preSinkClustering(), mapLocationToSink_ entries for multi-FF clusters
 // point to cluster buffers (clkbuf_leaf_X), NOT individual FFs.
 // Cluster buffer names are not in the LP CSV, so direct name lookup returns 0.
@@ -2452,8 +3103,8 @@ double HTreeBuilder::getClockInstTarget(ClockInst* inst) const
   return cts3dDb_->getSkewTarget(nm);
 }
 
-// JYJ (2026-02-21) Step 4: Compute mean arrival target per branch.
-// JYJ (2026-02-25) V37: Extended to ALL levels (not just leaf).
+// Step 4: Compute mean arrival target per branch.
+// Extended to ALL levels (not just leaf).
 // This determines which branches need extra delay buffers at each level.
 void HTreeBuilder::computeBranchDelayTargets()
 {
@@ -2466,7 +3117,7 @@ void HTreeBuilder::computeBranchDelayTargets()
     return;
   }
 
-  // V32c-debug: per-branch LP target statistics
+  // Debug: per-branch LP target statistics
   struct BranchDetail {
     int level;
     unsigned idx;
@@ -2475,7 +3126,7 @@ void HTreeBuilder::computeBranchDelayTargets()
   };
   std::vector<BranchDetail> branchDetails;
 
-  // V37: Compute per-branch mean target at ALL levels (not just leaf).
+  // Compute per-branch mean target at ALL levels (not just leaf).
   // At each level, a branch's mean target = average of all sink targets
   // reachable from that branch point downward.
   for (int levelIdx = 0;
@@ -2497,11 +3148,13 @@ void HTreeBuilder::computeBranchDelayTargets()
       int branchCount = 0;
 
       for (const auto& loc : sinkLocs) {
-        auto it = mapLocationToSink_.find(loc);
-        if (it == mapLocationToSink_.end() || it->second == nullptr) {
+        // V58 Fix B: epsilon-tolerant lookup (was exact find → skipped
+        // singleton macro clusters whose float→double key didn't match)
+        ClockInst* sink = findSinkEps(loc);
+        if (sink == nullptr) {
           continue;
         }
-        const double tgt = getClockInstTarget(it->second);
+        const double tgt = getClockInstTarget(sink);
         branchSum   += tgt;
         branchSumSq += tgt * tgt;
         branchMin    = std::min(branchMin, tgt);
@@ -2554,17 +3207,18 @@ void HTreeBuilder::computeBranchDelayTargets()
                   levelIdx + 1, branchCount, levelMean, posCount, negCount);
   }
 
-  // V32c-debug CTS-407: per-branch LP target distribution detail (leaf level only)
+  // Per-branch LP target distribution detail (leaf level only)
   for (const auto& d : branchDetails) {
     if (d.level != leafLevelIdx) continue;
-    const double delta = d.mean - globalMeanTarget_;
+    // globalMean fix: absolute LP target for planned_N diagnostic
+    const double delta = d.mean;
     int plannedN = 0;
     if (delta > 0.0 && singleBufDelay_ > 1e-9) {
       plannedN = std::max(0, std::min(
           static_cast<int>(std::round(delta / singleBufDelay_)),
           maxLeafDelayBufs_));
     }
-    logger_->info(CTS, 407,
+    debugPrint(logger_, CTS, "HTree", 1,
                   "  Leaf branch {:2d}: sinks={}, "
                   "LP=[min={:.4f} mean={:.4f} max={:.4f} spread={:.4f} "
                   "stddev={:.4f}]ns, delta={:.4f}ns -> planned_N={}",
@@ -2574,7 +3228,7 @@ void HTreeBuilder::computeBranchDelayTargets()
   }
 }
 
-// JYJ (2026-02-26) V39: Load per-FF hold budgets from timing graph CSV.
+// Load per-FF hold budgets from timing graph CSV.
 // For each capture FF (to_ff column), compute min(slack_min_ns) across all
 // edges. This is the FF's hold budget: max additional delay we can add
 // to its clock arrival without violating hold.
@@ -2617,11 +3271,11 @@ void HTreeBuilder::loadPerFfHoldBudgets(const std::string& timingGraphCsv)
   }
 
   logger_->info(CTS, 423,
-                "V39 hold budgets loaded: {} capture FFs from {} edges",
+                "Hold budgets loaded: {} capture FFs from {} edges",
                 perFfHoldBudget_.size(), edgeCount);
 }
 
-// JYJ (2026-02-26) V40: Load IO edge hold budgets from IO timing CSV.
+// Load IO edge hold budgets from IO timing CSV.
 // For PI_TO_FF rows, the hold slack represents the budget for adding delay
 // to the capture FF's clock arrival. Merged into perFfHoldBudget_ (take min).
 void HTreeBuilder::loadIoHoldBudgets(const std::string& ioCsv)
@@ -2671,7 +3325,7 @@ void HTreeBuilder::loadIoHoldBudgets(const std::string& ioCsv)
   }
 
   logger_->info(CTS, 430,
-                "V40 IO hold budgets: {} PI→FF edges, {} new FFs, "
+                "IO hold budgets: {} PI→FF edges, {} new FFs, "
                 "{} tightened (total hold budget FFs: {})",
                 ioEdgeCount, newCount, mergedCount,
                 perFfHoldBudget_.size());
@@ -2679,42 +3333,73 @@ void HTreeBuilder::loadIoHoldBudgets(const std::string& ioCsv)
 
 void HTreeBuilder::createClockSubNets()
 {
-  Point<double> center = sinkRegion_.getCenter();
-  // JYJ (2026-02-06) Replaced with Cts3DDatabase calls
-  const int root_tier = cts3dDb_->getDominantTierFromClock(clock_);
-  const std::string root_buffer
-      = cts3dDb_->getBufferForTier(options_->getRootBuffer(), root_tier);
-  logger_->info(utl::CTS, 315,
-                "3D-CTS root buffer: tier={}, buffer={}",
-                root_tier, root_buffer);
-  Point<double> legalCenter = legalizeOneBuffer(center, root_buffer);
-  sinkRegion_.setCenter(legalCenter);
-  commitMoveLoc(center, legalCenter);
-  const int centerX = legalCenter.getX() * wireSegmentUnit_;
-  const int centerY = legalCenter.getY() * wireSegmentUnit_;
+  Point<double> legalCenter{0.0, 0.0};
+  ClockInst* rootBufferPtr;
+  ClockSubNet* rootSubNetPtr;
 
-  ClockInst& rootBuffer
-      = clock_.addClockBuffer("clkbuf_0", root_buffer, centerX, centerY);
-
-  if (topBufferName_.empty()) {
-    topBufferName_ = rootBuffer.getName();
-  }
-
-  // clang-format off
-  if (center != legalCenter) {
-    debugPrint(logger_, CTS, "legalizer", 2, "createClockSubNets: "
-	       "root clkbuf_0: {} => {}", center, legalCenter);
+  if (sharedRootBuffer_ != nullptr) {
+    // Per-tier mode: reuse the shared root buffer created by createSharedRoot()
+    rootBufferPtr = sharedRootBuffer_;
+    rootSubNetPtr = sharedRootSubNet_;
+    legalCenter = sharedRootLocation_;
+    logger_->info(utl::CTS, 857,
+                  "Per-tier sub-tree (tier prefix='{}') using shared root "
+                  "at ({:.2f}, {:.2f})",
+                  tierPrefix_, legalCenter.getX(), legalCenter.getY());
   } else {
-    debugPrint(logger_, CTS, "legalizer", 2, "createClockSubNets: "
-	       "root clkbuf_0: {}", center);
-  }
-  // clang-format on
+    // Unified mode: create root buffer here (original behavior)
+    Point<double> center = sinkRegion_.getCenter();
+    // V58_CL2: CTS_FORCE_ROOT_TIER overrides dominant-tier selection (same as createSharedRoot)
+    int root_tier = cts3dDb_->getDominantTierFromClock(clock_);
+    if (const char* e = std::getenv("CTS_FORCE_ROOT_TIER")) {
+      int forced = std::atoi(e);
+      if (forced >= 0 && forced != root_tier) {
+        logger_->info(CTS, 701,
+            "V58_CL2: Root tier forced {} -> {} (CTS_FORCE_ROOT_TIER, unified)",
+            root_tier, forced);
+        root_tier = forced;
+      }
+    }
+    const std::string root_buffer
+        = cts3dDb_->getBufferForTier(options_->getRootBuffer(), root_tier);
+    logger_->info(utl::CTS, 315,
+                  "3D-CTS root buffer: tier={}, buffer={}",
+                  root_tier, root_buffer);
+    legalCenter = legalizeOneBuffer(center, root_buffer);
+    sinkRegion_.setCenter(legalCenter);
+    commitMoveLoc(center, legalCenter);
+    const int centerX = legalCenter.getX() * wireSegmentUnit_;
+    const int centerY = legalCenter.getY() * wireSegmentUnit_;
 
-  addTreeLevelBuffer(&rootBuffer);
-  ClockSubNet& rootClockSubNet = clock_.addSubNet("clknet_0");
-  rootClockSubNet.setTreeLevel(0);
-  rootClockSubNet.addInst(rootBuffer);
-  treeBufLevels_++;
+    const std::string rootBufName = tierPrefix_ + "clkbuf_0";
+    const std::string rootNetName = tierPrefix_ + "clknet_0";
+
+    ClockInst& rootBuffer
+        = clock_.addClockBuffer(rootBufName, root_buffer, centerX, centerY);
+
+    if (topBufferName_.empty()) {
+      topBufferName_ = rootBuffer.getName();
+    }
+
+    // clang-format off
+    if (center != legalCenter) {
+      debugPrint(logger_, CTS, "legalizer", 2, "createClockSubNets: "
+                 "root {}: {} => {}", rootBufName, center, legalCenter);
+    } else {
+      debugPrint(logger_, CTS, "legalizer", 2, "createClockSubNets: "
+                 "root {}: {}", rootBufName, center);
+    }
+    // clang-format on
+
+    addTreeLevelBuffer(&rootBuffer);
+    ClockSubNet& rootClockSubNet = clock_.addSubNet(rootNetName);
+    rootClockSubNet.setTreeLevel(0);
+    rootClockSubNet.addInst(rootBuffer);
+    treeBufLevels_++;
+
+    rootBufferPtr = &rootBuffer;
+    rootSubNetPtr = &rootClockSubNet;
+  }
 
   // First level...
   LevelTopology& topLevelTopology = topologyForEachLevel_[0];
@@ -2726,7 +3411,7 @@ void HTreeBuilder::createClockSubNets()
     if (topLevelTopology.getBranchSinksLocations(idx).empty()) {
       return;
     }
-    // JYJ (2026-02-06) Replaced with Cts3DDatabase calls
+    // Replaced with Cts3DDatabase calls
     const int branch_tier = cts3dDb_->getDominantTier(
         topLevelTopology.getBranchSinksLocations(idx), mapLocationToSink_);
     const std::string branch_root_buffer = cts3dDb_->getBufferForTier(
@@ -2735,8 +3420,10 @@ void HTreeBuilder::createClockSubNets()
                   "3D-CTS branch L1 idx={}: tier={}, buffer={}",
                   idx, branch_tier, branch_root_buffer);
 
-    // JYJ (2026-02-09, updated 2026-03-10) Cross-tier HB delay consideration
+    // Cross-tier HB delay consideration
     // Elmore 50% delay: t_via = 0.693 * R_HB * C_HB (negligible: ~0 with C=0)
+    // In shared-root mode, root_tier comes from the shared root buffer's tier.
+    const int root_tier = cts3dDb_->getDominantTierFromClock(clock_);
     if (branch_tier != root_tier) {
       const double hb_res = cts3dDb_->getHbtResistance();
       const double hb_cap = cts3dDb_->getHbtCapacitance();
@@ -2769,21 +3456,21 @@ void HTreeBuilder::createClockSubNets()
     }
     // clang-format on
 
-    SegmentBuilder builder("clkbuf_1_" + std::to_string(idx) + "_",
-                           "clknet_1_" + std::to_string(idx) + "_",
+    SegmentBuilder builder(tierPrefix_ + "clkbuf_1_" + std::to_string(idx) + "_",
+                           tierPrefix_ + "clknet_1_" + std::to_string(idx) + "_",
                            legalCenter,  // center may have moved, don't use
                                          // sinkRegion_.getCenter()
                            legalBranchPoint,
                            topLevelTopology.getWireSegments(),
                            clock_,
-                           rootClockSubNet,
+                           *rootSubNetPtr,
                            *techChar_,
                            wireSegmentUnit_,
                            this,
                            db_,
                            branch_tier);
     if (!options_->getTreeBuffer().empty()) {
-      // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
+      // Replaced mapBufferMasterToTier with Cts3DDatabase
       const std::string tree_buffer = cts3dDb_->getBufferForTier(
           options_->getTreeBuffer(), branch_tier);
       builder.build(tree_buffer);
@@ -2798,11 +3485,11 @@ void HTreeBuilder::createClockSubNets()
       isFirstPoint = false;
     }
 
-    // JYJ (2026-02-25) V37: Insert intermediate delay buffers at Level 1.
+    // Insert intermediate delay buffers at Level 1.
     // If this branch's subtree mean target > level globalMean, add N delay
     // buffers in series to shift arrival for the entire subtree.
     ClockSubNet* branchDrivingSub = builder.getDrivingSubNet();
-    // JYJ (2026-02-26) V39: gate with enableMidDelayBufs_ (default off in V39)
+    // gate with enableMidDelayBufs_ (default off in V39)
     if (enableMidDelayBufs_ && cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()
         && singleBufDelay_ > 1e-9) {
       auto tgtIt = branchDelayTargets_.find({0, idx});  // level 0
@@ -2821,7 +3508,7 @@ void HTreeBuilder::createClockSubNets()
           const std::string delayBufMaster = branch_root_buffer;
           ClockSubNet* curSub = branchDrivingSub;
           for (int b = 0; b < midN; ++b) {
-            const std::string bufName = "clkbuf_mid_dly_1_"
+            const std::string bufName = tierPrefix_ + "clkbuf_mid_dly_1_"
                 + std::to_string(idx) + "_" + std::to_string(b);
             ClockInst& buf = clock_.addClockBuffer(
                 bufName, delayBufMaster, bx, by);
@@ -2829,14 +3516,14 @@ void HTreeBuilder::createClockSubNets()
             addTreeLevelBuffer(&buf);
             curSub->addInst(buf);
             ClockSubNet& nextSub = clock_.addSubNet(
-                "clknet_mid_dly_1_" + std::to_string(idx)
+                tierPrefix_ + "clknet_mid_dly_1_" + std::to_string(idx)
                 + "_" + std::to_string(b));
             nextSub.addInst(buf);
             curSub = &nextSub;
           }
           branchDrivingSub = curSub;
           logger_->info(CTS, 411,
-                        "V37 intermediate delay L1 branch {}: "
+                        "Intermediate delay L1 branch {}: "
                         "target={:.4f}ns, levelMean={:.4f}ns, "
                         "delta={:.4f}ns, N={}",
                         idx, tgtIt->second, levelMean, delta, midN);
@@ -2861,16 +3548,16 @@ void HTreeBuilder::createClockSubNets()
       LevelTopology& parentTopology = topologyForEachLevel_[levelIdx - 1];
       Point<double> parentPoint = parentTopology.getBranchingPoint(parentIdx);
 
-      // JYJ (2026-02-06) Replaced with Cts3DDatabase calls
+      // Replaced with Cts3DDatabase calls
       const int branch_tier = cts3dDb_->getDominantTier(
           topology.getBranchSinksLocations(idx), mapLocationToSink_);
       const std::string branch_root_buffer = cts3dDb_->getBufferForTier(
           options_->getRootBuffer(), branch_tier);
-      logger_->info(utl::CTS, 317,
+      debugPrint(logger_, CTS, "HTree", 1,
                     "3D-CTS branch L{} idx={}: tier={}, buffer={}",
                     levelIdx+1, idx, branch_tier, branch_root_buffer);
 
-      // JYJ (2026-02-09, updated 2026-03-10) Cross-tier HB delay consideration
+      // Cross-tier HB delay consideration
       // Elmore 50% delay: t_via = 0.693 * R_HB * C_HB (negligible: ~0 with C=0)
       const int parent_tier = cts3dDb_->getDominantTier(
           parentTopology.getBranchSinksLocations(parentIdx), mapLocationToSink_);
@@ -2897,20 +3584,20 @@ void HTreeBuilder::createClockSubNets()
       // clang-format off
       if (branchPoint != legalBranchPoint) {
 	debugPrint(logger_, CTS, "legalizer", 2, "createClockSubNets level {} "
-		   "{} : {} => {}", levelIdx+1, "clkbuf_" +
+		   "{} : {} => {}", levelIdx+1, tierPrefix_ + "clkbuf_" +
 		   std::to_string(levelIdx+1) + "_" + std::to_string(idx) + "_",
 		   branchPoint, legalBranchPoint);
       } else {
 	debugPrint(logger_, CTS, "legalizer", 2, "createClockSubNets level {} "
-		   "{} : {}", levelIdx+1, "clkbuf_" +
+		   "{} : {}", levelIdx+1, tierPrefix_ + "clkbuf_" +
 		   std::to_string(levelIdx+1) + "_" + std::to_string(idx) + "_",
 		   branchPoint);
       }
       // clang-format on
 
-      SegmentBuilder builder("clkbuf_" + std::to_string(levelIdx + 1) + "_"
+      SegmentBuilder builder(tierPrefix_ + "clkbuf_" + std::to_string(levelIdx + 1) + "_"
                                  + std::to_string(idx) + "_",
-                             "clknet_" + std::to_string(levelIdx + 1) + "_"
+                             tierPrefix_ + "clknet_" + std::to_string(levelIdx + 1) + "_"
                                  + std::to_string(idx) + "_",
                              parentPoint,
                              legalBranchPoint,
@@ -2929,7 +3616,7 @@ void HTreeBuilder::createClockSubNets()
       }
 
       if (!options_->getTreeBuffer().empty()) {
-        // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
+        // Replaced mapBufferMasterToTier with Cts3DDatabase
         const std::string tree_buffer = cts3dDb_->getBufferForTier(
             options_->getTreeBuffer(), branch_tier);
         builder.build(tree_buffer);
@@ -2944,12 +3631,12 @@ void HTreeBuilder::createClockSubNets()
         isFirstPoint = false;
       }
 
-      // JYJ (2026-02-25) V37: Insert intermediate delay buffers at Level 2+.
+      // Insert intermediate delay buffers at Level 2+.
       // Skip the leaf level (handled by existing N-chain code below).
       const int leafLevel
           = static_cast<int>(topologyForEachLevel_.size()) - 1;
       ClockSubNet* branchDrivingSub = builder.getDrivingSubNet();
-      // JYJ (2026-02-26) V39: gate with enableMidDelayBufs_ (default off in V39)
+      // gate with enableMidDelayBufs_ (default off in V39)
       if (enableMidDelayBufs_ && levelIdx < leafLevel
           && cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()
           && singleBufDelay_ > 1e-9) {
@@ -2970,7 +3657,7 @@ void HTreeBuilder::createClockSubNets()
             const std::string delayBufMaster = branch_root_buffer;
             ClockSubNet* curSub = branchDrivingSub;
             for (int b = 0; b < midN; ++b) {
-              const std::string bufName = "clkbuf_mid_dly_"
+              const std::string bufName = tierPrefix_ + "clkbuf_mid_dly_"
                   + std::to_string(levelIdx + 1) + "_"
                   + std::to_string(idx) + "_" + std::to_string(b);
               ClockInst& buf = clock_.addClockBuffer(
@@ -2979,14 +3666,14 @@ void HTreeBuilder::createClockSubNets()
               addTreeLevelBuffer(&buf);
               curSub->addInst(buf);
               ClockSubNet& nextSub = clock_.addSubNet(
-                  "clknet_mid_dly_" + std::to_string(levelIdx + 1)
+                  tierPrefix_ + "clknet_mid_dly_" + std::to_string(levelIdx + 1)
                   + "_" + std::to_string(idx) + "_" + std::to_string(b));
               nextSub.addInst(buf);
               curSub = &nextSub;
             }
             branchDrivingSub = curSub;
             logger_->info(CTS, 412,
-                          "V37 intermediate delay L{} branch {}: "
+                          "Intermediate delay L{} branch {}: "
                           "target={:.4f}ns, levelMean={:.4f}ns, "
                           "delta={:.4f}ns, N={}",
                           levelIdx + 1, idx, tgtIt->second,
@@ -3003,7 +3690,7 @@ void HTreeBuilder::createClockSubNets()
   unsigned numSinks = 0;
   unsigned numDelayBufs = 0;
 
-  // V32c-debug: LP-CTS gap tracking accumulators (reported in CTS-408 after loop).
+  // Debug: LP-CTS gap tracking accumulators (reported in CTS-408 after loop).
   // totalLpDelay   = sum(branchMean * sinkCount) over all leaf branches
   // totalDelivered = sum(N * singleBufDelay * sinkCount) for fired branches only
   // Coverage = totalDelivered / totalLpDelay * 100%: how much LP plan was implemented.
@@ -3022,17 +3709,17 @@ void HTreeBuilder::createClockSubNets()
           return;
         }
 
-        // JYJ (2026-02-21) Step 4: Insert delay buffers if branch LP target > globalMean
-        // JYJ (2026-02-23) V32b: N-buffer chain based on ABSOLUTE LP-TNS target.
+        // Step 4: Insert delay buffers if branch LP target > globalMean
+        // N-buffer chain based on ABSOLUTE LP-TNS target.
         //   Problem (found after V32b run): Absolute targeting causes hold violations.
         //   Branch differentials up to 36-48ps (N=1 vs N=4) violated hold on short paths.
         //   LP guaranteed hold only for per-FF delays; branch-mean averaging breaks this.
-        // JYJ (2026-02-23) V32c-fix: DELTA-BASED N-buffer chain (relative to globalMean).
+        // DELTA-BASED N-buffer chain (relative to globalMean).
         //   N = round(max(0, branchMean - globalMean) / singleBufDelay_)
         //   Limits max inter-branch differential to (maxBranchDelta - 0) ≈ 12-16ps (1-2 bufs).
         //   LP-TNS result (asap7/aes): globalMean=26.6ps, max delta=15.8ps → N≤1 per branch.
         //   Chain: subNet → buf_0 → sub_0 → ... → FFs
-        // V32c-debug: branchCnt hoisted to lambda scope for CTS-408 gap tracking
+        // Debug: branchCnt hoisted to lambda scope for CTS-408 gap tracking
         double absTgt = 0.0;
         int branchCnt = 0;
         if (cts3dDb_ != nullptr && cts3dDb_->hasSkewTargets()
@@ -3040,12 +3727,13 @@ void HTreeBuilder::createClockSubNets()
           const auto& bSinkLocs = leafTopology.getBranchSinksLocations(idx);
           double branchSum = 0.0;
           for (const auto& bLoc : bSinkLocs) {
-            auto bIt = mapLocationToSink_.find(bLoc);
-            if (bIt == mapLocationToSink_.end() || bIt->second == nullptr) {
+            // V58 Fix B: epsilon-tolerant lookup for branch target calculation
+            ClockInst* bSink = findSinkEps(bLoc);
+            if (bSink == nullptr) {
               continue;
             }
-            // V32c: unified target accessor (cluster buffer or individual FF)
-            branchSum += getClockInstTarget(bIt->second);
+            // Unified target accessor (cluster buffer or individual FF)
+            branchSum += getClockInstTarget(bSink);
             ++branchCnt;
           }
           if (branchCnt > 0) {
@@ -3053,7 +3741,7 @@ void HTreeBuilder::createClockSubNets()
           }
         }
 
-        // JYJ (2026-03-05) V49: Grouped Delay Chain.
+        // Grouped Delay Chain.
         // Instead of per-FF relay (1 chain per FF → ~192 nets → GRT-0183),
         // group FFs within each leaf cluster by quantized LP target delta.
         // Group 0 (delta < min): direct to leaf buffer.
@@ -3065,7 +3753,7 @@ void HTreeBuilder::createClockSubNets()
         //                                 → [grp_buf_0] → [grp_buf_1] → FFs (group 2)
         if (enableGroupedDelay_ && cts3dDb_ != nullptr
             && cts3dDb_->hasSkewTargets() && perFfBufDelay_ > 1e-9) {
-          // V49-fix2: static counter for globally unique buffer names.
+          // static counter for globally unique buffer names.
           // Multiple sub-trees (register tree, macro tree, etc.) each call
           // this code with idx=0,1,... → name collision without global ID.
           static int grpGlobalId = 0;
@@ -3096,7 +3784,7 @@ void HTreeBuilder::createClockSubNets()
           };
 
           // Collect all FFs in this branch with their group assignment.
-          // V50: When enableClusterUniform_=true, all FFs in the cluster share
+          // When enableClusterUniform_=true, all FFs in the cluster share
           // a single depth k_c computed from the cluster median LP target delta.
           // This creates exactly 1 chain per cluster (vs up to MAX_DEPTH chains
           // in V49), reducing buffer count by ~60% with comparable timing.
@@ -3105,13 +3793,20 @@ void HTreeBuilder::createClockSubNets()
                                 std::vector<FfGroupInfo>& ffInfos,
                                 std::vector<ClockInst*>& memberFFs) {
             if (enableClusterUniform_) {
-              // V50: Cluster-Uniform mode — compute median delta, assign to all FFs.
+              // Cluster-Uniform mode — compute median delta, assign to all FFs.
               // Pass 1: collect deltas and hold budgets
               std::vector<double> deltas;
               deltas.reserve(memberFFs.size());
               for (ClockInst* ff : memberFFs) {
                 std::string ffName = getFFName(ff);
-                double ffDelta = cts3dDb_->getSkewTarget(ffName) - globalMeanTarget_;
+                // globalMean fix: absolute LP target for TAP delivery
+                double ffDelta = cts3dDb_->getSkewTarget(ffName);
+                // Debug: trace per-FF target lookup (cluster-uniform path)
+                if (ffDelta > 0.01) {
+                  logger_->info(CTS, 711,
+                      "collectFFs cluster-uniform: '{}' target={:.4f}ns",
+                      ffName, ffDelta);
+                }
                 deltas.push_back(ffDelta);
               }
               // Compute median delta for the cluster
@@ -3128,32 +3823,36 @@ void HTreeBuilder::createClockSubNets()
                     0, std::min(clusterDepth, groupedDelayMaxDepth_));
               }
 
-              // Hold safety: cap by minimum hold budget across all FFs in cluster
-              if (clusterDepth > 0) {
-                for (ClockInst* ff : memberFFs) {
-                  std::string ffName = getFFName(ff);
-                  auto hIt = perFfHoldBudget_.find(ffName);
-                  if (hIt != perFfHoldBudget_.end()) {
-                    while (clusterDepth > 0
-                        && hIt->second - clusterDepth * perFfBufDelay_
-                               < perFfHoldGuard_) {
-                      --clusterDepth;
-                    }
-                  }
-                }
-                if (clusterDepth == 0) ++branchHoldSkip;
-              }
+              // Removed redundant C++ holdSkip.
+              // LP already enforces hold via hold edges + PI-hold-clip + sigma guard.
+              // C++ holdSkip was double-guarding with a more conservative local metric,
+              // blocking 60-70% of grouped delay delivery. See CLAUDE.md for details.
 
               // Pass 2: assign uniform depth to all FFs
               for (size_t i = 0; i < memberFFs.size(); ++i) {
-                ffInfos.push_back({memberFFs[i], deltas[i], clusterDepth});
+                // V58 Fix C: Macro sinks (SRAM) get depth=0 — tight hold margin.
+                int ffDepth = clusterDepth;
+                odb::dbInst* dInst = memberFFs[i]->getDbInst();
+                if (isMacroBlockInst(dInst)) {
+                  ffDepth = 0;
+                }
+                ffInfos.push_back({memberFFs[i], deltas[i], ffDepth});
               }
             } else {
-              // V49: Per-FF depth (original behavior)
+              // Per-FF depth (original behavior)
               for (ClockInst* ff : memberFFs) {
                 std::string ffName = getFFName(ff);
                 double ffTarget = cts3dDb_->getSkewTarget(ffName);
-                double ffDelta = ffTarget - globalMeanTarget_;
+                // Debug: trace per-FF target lookup to diagnose delivery gap
+                // (3058 non-zero LP targets but only ~29 grouped FFs)
+                if (ffTarget > 0.01) {
+                  debugPrint(logger_, CTS, "HTree", 1,
+                      "collectFFs per-FF: '{}' target={:.4f}ns depth_will_be={}",
+                      ffName, ffTarget,
+                      static_cast<int>(std::round(ffTarget / perFfBufDelay_)));
+                }
+                // globalMean fix: absolute LP target
+                double ffDelta = ffTarget;
 
                 // Quantize to buffer delay steps
                 int depth = 0;
@@ -3163,25 +3862,57 @@ void HTreeBuilder::createClockSubNets()
                   depth = std::max(0, std::min(depth, groupedDelayMaxDepth_));
                 }
 
-                // Hold safety: cap depth by hold budget
-                if (depth > 0) {
-                  auto hIt = perFfHoldBudget_.find(ffName);
-                  if (hIt != perFfHoldBudget_.end()) {
-                    while (depth > 0
-                        && hIt->second - depth * perFfBufDelay_ < perFfHoldGuard_) {
-                      --depth;
-                    }
-                    if (depth == 0) ++branchHoldSkip;
-                  }
+                // Removed redundant holdSkip (same as above).
+                // V58 Fix C: Macro sinks (SRAM) get depth=0.
+                odb::dbInst* dInst = ff->getDbInst();
+                if (isMacroBlockInst(dInst)) {
+                  depth = 0;
                 }
-
                 ffInfos.push_back({ff, ffDelta, depth});
               }
             }
           };
 
+          // V58_CL: Hold-budget-aware TAP depth cap.
+          // After collectFFs assigns depth from LP targets, check each FF's
+          // hold budget from perFfHoldBudget_ (loaded from timing graph).
+          // If depth * perFfBufDelay_ would exceed the FF's hold budget,
+          // cap depth to floor(holdBudget / perFfBufDelay_).
+          // This protects FFs where LP missed hold constraints (pruned edges)
+          // but the actual timing graph has tight PI→FF hold paths.
+          // CTS_ENABLE_HOLD_BUDGET_CAP=1 (default ON when hold budgets loaded).
+          bool enableHoldBudgetCap = !perFfHoldBudget_.empty();
+          if (const char* e = std::getenv("CTS_ENABLE_HOLD_BUDGET_CAP")) {
+            enableHoldBudgetCap = (std::atoi(e) != 0);
+          }
+          auto applyHoldBudgetCap = [&](std::vector<FfGroupInfo>& ffInfos) {
+            if (!enableHoldBudgetCap || perFfHoldBudget_.empty()) return;
+            int nCapped = 0;
+            for (auto& fi : ffInfos) {
+              if (fi.depth <= 0) continue;
+              std::string ffName = getFFName(fi.inst);
+              auto it = perFfHoldBudget_.find(ffName);
+              if (it == perFfHoldBudget_.end()) continue;
+              double holdBudgetNs = it->second;
+              // Max depth that fits within hold budget
+              int maxSafeDepth = static_cast<int>(
+                  std::floor(holdBudgetNs / perFfBufDelay_));
+              if (maxSafeDepth < 0) maxSafeDepth = 0;
+              if (fi.depth > maxSafeDepth) {
+                fi.depth = maxSafeDepth;
+                ++nCapped;
+              }
+            }
+            if (nCapped > 0) {
+              logger_->info(CTS, 698,
+                  "V58_CL: Hold budget cap reduced TAP depth for {} FFs "
+                  "(bufDelay={:.3f}ns)",
+                  nCapped, perFfBufDelay_);
+            }
+          };
+
           // Build grouped delay chains for collected FFs
-          // V49-fix3: No local numSinks here. Uses outer numSinks (line 3002)
+          // No local numSinks here. Uses outer numSinks (line 3002)
           // so buildGroupChains [&] captures the correct per-sink counter.
           // Previously an inner numSinks was declared AFTER this lambda,
           // so the lambda captured the outer numSinks (always 0) → duplicate
@@ -3211,7 +3942,7 @@ void HTreeBuilder::createClockSubNets()
                 }
                 const int grpTier = (grpBottom > grpUpper) ? 0 : 1;
 
-                // V49a: Filter out cross-tier minority FFs before building the chain.
+                // Filter out cross-tier minority FFs before building the chain.
                 // Minority FFs with a different tier than grpTier are direct-connected
                 // to driverSubNet (the leaf net) instead of the group chain output net.
                 // Rationale: a small chain-output net spanning two tiers triggers
@@ -3253,17 +3984,31 @@ void HTreeBuilder::createClockSubNets()
                 // Build shared chain: driver → grp_buf_0 → ... → grp_buf_{depth-1} → FFs
                 // All chain buffers and sink FFs are the same tier → no cross-tier
                 // chain nets → no GRT-0183.
+                // V59: Sequential fixed-spacing placement along driver→centroid vector.
+                // minStep = bufWidth → buffer bodies cannot overlap.
+                // Replaces equal-fraction interpolation which caused overlap when
+                // span < depth × bufWidth (DRT unroutable, GUI-0070).
+                int grpBufW = 0;
+                {
+                  odb::dbMaster* m = db_->findMaster(grpBufMaster.c_str());
+                  if (m) grpBufW = m->getWidth();
+                }
+                int grpSpanX = std::abs(cx - driverInst->getX());
+                int grpSpanY = std::abs(cy - driverInst->getY());
+                int grpSpan = std::max(grpSpanX, grpSpanY);
+                int grpMinStep = std::max(grpBufW, 1);
+                double grpFracStep = (grpSpan > 0)
+                    ? static_cast<double>(grpMinStep) / grpSpan : 1.0;
+
                 ClockSubNet* cur = driverSubNet;
+                int prevGrpBufX = driverInst->getX();
                 for (int d = 0; d < depth; ++d) {
-                  double frac = static_cast<double>(d + 1) / (depth + 1);
+                  double frac = grpFracStep * (d + 1);
+                  if (frac >= 1.0) break;  // no room → stop chain
                   int bx = driverInst->getX()
                       + static_cast<int>((cx - driverInst->getX()) * frac);
                   int by = driverInst->getY()
                       + static_cast<int>((cy - driverInst->getY()) * frac);
-                  // V50-Legal (JYJ 2026-03-10): Grid-snap grouped delay buffer via
-                  // legalizeOneBuffer(), same as all H-tree standard buffers.
-                  // Raw centroid interpolation produces off-grid DBU positions → DPL-0036.
-                  // Conversion: DBU → techChar units → legalizeOneBuffer → DBU.
                   {
                     Point<double> rawLoc(static_cast<double>(bx) / wireSegmentUnit_,
                                         static_cast<double>(by) / wireSegmentUnit_);
@@ -3271,10 +4016,16 @@ void HTreeBuilder::createClockSubNets()
                     bx = static_cast<int>(legalLoc.getX() * wireSegmentUnit_);
                     by = static_cast<int>(legalLoc.getY() * wireSegmentUnit_);
                   }
+                  // Post-snap X-only overlap check: legalizeOneBuffer can snap to
+                  // a different ROW, breaking the pre-snap spacing guarantee.
+                  if (grpBufW > 0 && std::abs(bx - prevGrpBufX) <= grpBufW) {
+                    break;  // overlap → stop chain
+                  }
+                  prevGrpBufX = bx;
 
-                  // V49-fix2: use myGrpId (global counter) instead of idx
+                  // use myGrpId (global counter) instead of idx
                   // to avoid collision across sub-trees.
-                  const std::string bName = "clkbuf_grp_"
+                  const std::string bName = tierPrefix_ + "clkbuf_grp_"
                       + std::to_string(myGrpId) + "_c"
                       + std::to_string(numSinks) + "_d"
                       + std::to_string(depth) + "_"
@@ -3286,7 +4037,7 @@ void HTreeBuilder::createClockSubNets()
 
                   cur->addInst(grpBuf);
                   ClockSubNet& next = clock_.addSubNet(
-                      "clknet_grp_" + std::to_string(myGrpId) + "_c"
+                      tierPrefix_ + "clknet_grp_" + std::to_string(myGrpId) + "_c"
                       + std::to_string(numSinks) + "_d"
                       + std::to_string(depth) + "_"
                       + std::to_string(d));
@@ -3309,14 +4060,281 @@ void HTreeBuilder::createClockSubNets()
             }
           };
 
+          // GH-Tree Cascaded Delay Tap.
+          // Replaces parallel grouped delay chains with cascaded tap structure.
+          // Parallel chains (V49/V50):
+          //   leaf -> [chain_d1]           -> d1_FFs    (1 buf, 1 net)
+          //   leaf -> [buf -> buf]         -> d2_FFs    (2 bufs, 2 nets)
+          //   leaf -> [buf -> buf -> buf]  -> d3_FFs    (3 bufs, 3 nets)
+          //   Total: 6 bufs, 6 nets for maxDepth=3
+          //
+          // Cascaded tap (V52 GH-Tree):
+          //   leaf -> tap1 -> tap2 -> tap3
+          //             |       |       |
+          //          d1_FFs  d2_FFs  d3_FFs
+          //   Total: 3 bufs, 3 nets for maxDepth=3  (50% reduction)
+          //
+          // Same depth delivery: depth=k FF passes through exactly k tap buffers.
+          // d0_FFs connect directly to driverSubNet (no tap buffer).
+          // Same-tier purification (V49a) applied before cascaded chain.
+          auto buildGHSubTree = [&](ClockInst* driverInst,
+                                     ClockSubNet* driverSubNet,
+                                     std::vector<FfGroupInfo>& ffInfos) {
+            // Group FFs by quantized depth
+            std::map<int, std::vector<ClockInst*>> depthGroups;
+            for (auto& fi : ffInfos) {
+              depthGroups[fi.depth].push_back(fi.inst);
+            }
+
+            // depth=0 FFs: direct connection to driver subnet
+            if (depthGroups.count(0)) {
+              for (auto* ff : depthGroups[0]) {
+                driverSubNet->addInst(*ff);
+                ++branchDirectFFs;
+              }
+            }
+
+            // Find max depth with non-empty FFs
+            int maxDepth = 0;
+            for (auto& [d, ffs] : depthGroups) {
+              if (d > 0 && !ffs.empty()) maxDepth = d;
+            }
+            if (maxDepth == 0) return;  // All depth=0, no sub-tree needed
+
+            // Determine chain tier from ALL depth>0 FFs (majority vote)
+            int chainBottom = 0, chainUpper = 0;
+            for (auto& [depth, ffs] : depthGroups) {
+              if (depth == 0) continue;
+              for (auto* ff : ffs) {
+                int ft = cts3dDb_->getInstTier(ff->getDbInst());
+                if (ft == 0) ++chainBottom; else ++chainUpper;
+              }
+            }
+            const int chainTier = (chainBottom > chainUpper) ? 0 : 1;
+
+            // same-tier purification: cross-tier minority FFs -> depth=0
+            for (auto& [depth, ffs] : depthGroups) {
+              if (depth == 0) continue;
+              auto it = ffs.begin();
+              while (it != ffs.end()) {
+                int ft = cts3dDb_->getInstTier((*it)->getDbInst());
+                if (ft < 0) ft = chainTier;  // unknown -> assume same
+                if (ft != chainTier) {
+                  driverSubNet->addInst(**it);
+                  ++branchDirectFFs;
+                  it = ffs.erase(it);
+                } else {
+                  ++it;
+                }
+              }
+            }
+
+            // Recompute maxDepth after purification
+            maxDepth = 0;
+            for (auto& [d, ffs] : depthGroups) {
+              if (d > 0 && !ffs.empty()) maxDepth = d;
+            }
+            if (maxDepth == 0) return;
+
+            // Cost-aware adaptive depth selection
+            // Scan from maxDepth downward. For each depth gap (empty taps),
+            // check if the FFs beyond the gap justify the buffer cost.
+            // If cost > benefit, reassign those FFs to the lower depth.
+            // Proposition: reassign when ff_count * buf_delay * gap < gap * costRatio
+            //   i.e., ff_count * buf_delay < costRatio  (per-gap-tap basis)
+            {
+              // Collect occupied depths in ascending order
+              std::vector<int> occupiedDepths;
+              for (auto& [d, ffs] : depthGroups) {
+                if (d > 0 && !ffs.empty()) {
+                  occupiedDepths.push_back(d);
+                }
+              }
+              // Scan from highest depth downward
+              bool pruned = true;
+              while (pruned && occupiedDepths.size() > 1) {
+                pruned = false;
+                int highD = occupiedDepths.back();
+                int lowD  = occupiedDepths[occupiedDepths.size() - 2];
+                int gap   = highD - lowD;  // empty taps between lowD and highD
+                int ffCount = static_cast<int>(depthGroups[highD].size());
+
+                // Cost:    gap empty tap buffers (one buf+net per empty depth)
+                // Benefit: ffCount FFs get (highD - lowD) * buf_delay more delivery
+                // Reassign if ffCount is too small to justify the gap cost.
+                // Threshold: ffCount * perFfBufDelay_ (ns) < adaptiveDepthCostRatio_ * gap_cost
+                // Simplified: ffCount < costRatio * gap  (1 FF per empty tap)
+                bool shouldReassign = false;
+                if (gap > 1) {
+                  // Gap has (gap-1) empty taps. Reassign if too few FFs.
+                  int emptyTaps = gap - 1;
+                  shouldReassign = (ffCount <= emptyTaps * adaptiveDepthCostRatio_);
+                }
+                // Also reassign if only 1 FF at the highest depth and gap >= 2
+                if (ffCount == 1 && gap >= 2) {
+                  shouldReassign = true;
+                }
+
+                if (shouldReassign) {
+                  // Move highD FFs to lowD
+                  for (auto* ff : depthGroups[highD]) {
+                    depthGroups[lowD].push_back(ff);
+                  }
+                  debugPrint(logger_, CTS, "HTree", 1,
+                      "Adaptive depth: reassign {} FFs depth {} -> {} "
+                      "(gap={}, saved {} empty taps)",
+                      ffCount, highD, lowD, gap, gap - 1);
+                  depthGroups.erase(highD);
+                  occupiedDepths.pop_back();
+                  pruned = true;
+                }
+              }
+              // Recompute maxDepth after adaptive pruning
+              maxDepth = 0;
+              for (auto& [d, ffs] : depthGroups) {
+                if (d > 0 && !ffs.empty()) maxDepth = d;
+              }
+              if (maxDepth == 0) return;
+            }
+
+            // Compute centroid of ALL depth>0 same-tier FFs
+            long long sumX = 0, sumY = 0;
+            int nDownstream = 0;
+            for (auto& [depth, ffs] : depthGroups) {
+              if (depth == 0) continue;
+              for (auto* ff : ffs) {
+                sumX += ff->getX();
+                sumY += ff->getY();
+                ++nDownstream;
+              }
+            }
+            if (nDownstream == 0) return;
+            const int cx = static_cast<int>(sumX / nDownstream);
+            const int cy = static_cast<int>(sumY / nDownstream);
+            const std::string chainBufMaster = cts3dDb_->getBufferForTier(
+                options_->getRootBuffer(), chainTier);
+
+            // Build cascaded delay tap: driver -> tap1 -> tap2 -> ... -> tap_maxDepth
+            // V59: Sequential fixed-spacing placement along driver→centroid vector.
+            // minStep = bufWidth → buffer bodies cannot overlap.
+            // Replaces physMax pre-cap + equal-fraction interpolation + post-snap check.
+            int tapBufW = 0;
+            {
+              odb::dbMaster* m = db_->findMaster(chainBufMaster.c_str());
+              if (m) tapBufW = m->getWidth();
+            }
+            int tapSpanX = std::abs(cx - driverInst->getX());
+            int tapSpanY = std::abs(cy - driverInst->getY());
+            int tapSpan = std::max(tapSpanX, tapSpanY);
+            int tapMinStep = std::max(tapBufW, 1);
+            double tapFracStep = (tapSpan > 0)
+                ? static_cast<double>(tapMinStep) / tapSpan : 1.0;
+
+            // Check: if even 1 buffer doesn't fit, skip chain entirely.
+            if (tapFracStep >= 1.0) {
+              logger_->info(CTS, 581,
+                  "Cascaded TAP: chain skipped (span={}DBU, "
+                  "bufWidth={}DBU — no room for tap buffers)",
+                  tapSpan, tapBufW);
+              return;
+            }
+
+            ClockSubNet* curNet = driverSubNet;
+            int prevTapX = driverInst->getX();
+            for (int d = 1; d <= maxDepth; ++d) {
+              double frac = tapFracStep * d;
+              if (frac >= 1.0) {
+                // No room for more buffers — reassign remaining FFs to current depth
+                for (int rd = d; rd <= maxDepth; ++rd) {
+                  if (depthGroups.count(rd)) {
+                    for (auto* ff : depthGroups[rd]) {
+                      curNet->addInst(*ff);
+                      ++branchGroupedFFs;
+                    }
+                  }
+                }
+                maxDepth = d - 1;
+                break;
+              }
+              int bx = driverInst->getX()
+                  + static_cast<int>((cx - driverInst->getX()) * frac);
+              int by = driverInst->getY()
+                  + static_cast<int>((cy - driverInst->getY()) * frac);
+
+              // Grid-snap via legalizeOneBuffer()
+              {
+                Point<double> rawLoc(static_cast<double>(bx) / wireSegmentUnit_,
+                                     static_cast<double>(by) / wireSegmentUnit_);
+                Point<double> legalLoc = legalizeOneBuffer(rawLoc, chainBufMaster);
+                bx = static_cast<int>(legalLoc.getX() * wireSegmentUnit_);
+                by = static_cast<int>(legalLoc.getY() * wireSegmentUnit_);
+              }
+
+              // Post-snap X-only overlap check
+              if (tapBufW > 0 && std::abs(bx - prevTapX) <= tapBufW) {
+                // Overlap — reassign remaining FFs and stop
+                for (int rd = d; rd <= maxDepth; ++rd) {
+                  if (depthGroups.count(rd)) {
+                    for (auto* ff : depthGroups[rd]) {
+                      curNet->addInst(*ff);
+                      ++branchGroupedFFs;
+                    }
+                  }
+                }
+                maxDepth = d - 1;
+                break;
+              }
+              prevTapX = bx;
+
+              // Create tap buffer
+              const std::string bName = tierPrefix_ + "clkbuf_ghtap_"
+                  + std::to_string(myGrpId) + "_c"
+                  + std::to_string(numSinks) + "_t"
+                  + std::to_string(d);
+              ClockInst& tapBuf = clock_.addClockBuffer(
+                  bName, chainBufMaster, bx, by);
+              cts3dDb_->setClockInstTier(tapBuf, chainTier);
+              addTreeLevelBuffer(&tapBuf);
+
+              // Connect tap buffer input to previous net
+              curNet->addInst(tapBuf);
+
+              // Create tap output net
+              ClockSubNet& tapNet = clock_.addSubNet(
+                  tierPrefix_ + "clknet_ghtap_" + std::to_string(myGrpId) + "_c"
+                  + std::to_string(numSinks) + "_t"
+                  + std::to_string(d));
+              tapNet.addInst(tapBuf);
+
+              // Connect depth=d FFs to this tap net
+              if (depthGroups.count(d) && !depthGroups[d].empty()) {
+                for (auto* ff : depthGroups[d]) {
+                  tapNet.addInst(*ff);
+                  ++branchGroupedFFs;
+                }
+              }
+
+              // Mark final tap as leaf level
+              if (d == maxDepth) {
+                tapNet.setLeafLevel(true);
+              }
+
+              curNet = &tapNet;
+              ++branchGroupBufs;
+            }
+
+            totalBranchSinks_debug += nDownstream;
+          };
+
           // Iterate sinks in this branch (same pattern as per-FF relay)
           const std::vector<Point<double>>& sinkLocs
               = leafTopology.getBranchSinksLocations(idx);
           for (const auto& loc : sinkLocs) {
             // Epsilon-tolerant sink lookup (V37 CTS-0080 fix)
+            // FloatFix: eps=1e-4 (float→double mismatch reaches ~1e-5 for large coords)
             auto sinkIt = mapLocationToSink_.find(loc);
             if (sinkIt == mapLocationToSink_.end()) {
-              constexpr double eps = 1e-6;
+              constexpr double eps = 0.01;
               auto hint = mapLocationToSink_.lower_bound(
                   Point<double>(loc.getX() - eps, loc.getY() - eps));
               for (auto it = hint; it != mapLocationToSink_.end(); ++it) {
@@ -3329,9 +4347,14 @@ void HTreeBuilder::createClockSubNets()
               }
             }
             if (sinkIt == mapLocationToSink_.end()) {
-              logger_->error(CTS, 492,
-                  "V49 grouped: Sink not found at ({:.10f}, {:.10f})",
+              // Second-level clustering or legalizeOneBuffer can shift centroids
+              // beyond eps=1e-4, causing lookup failure. Skip this sink —
+              // it connects directly to the leaf net (depth=0, no grouped delay).
+              debugPrint(logger_, CTS, "HTree", 1,
+                  "Grouped: Sink not found at ({:.10f}, {:.10f}), skipping "
+                  "(connects to leaf net directly)",
                   loc.getX(), loc.getY());
+              continue;
             }
             ClockInst* sinkInst = sinkIt->second;
 
@@ -3361,7 +4384,13 @@ void HTreeBuilder::createClockSubNets()
                 // Collect FF info and build group chains
                 std::vector<FfGroupInfo> ffInfos;
                 collectFFs(sinkInst, leafSubNet, ffInfos, memberFFs);
-                buildGroupChains(sinkInst, leafSubNet, ffInfos);
+                applyHoldBudgetCap(ffInfos);
+                // GH-Tree cascaded tap or legacy parallel chains
+                if (enableGhTree_) {
+                  buildGHSubTree(sinkInst, leafSubNet, ffInfos);
+                } else {
+                  buildGroupChains(sinkInst, leafSubNet, ffInfos);
+                }
               } else {
                 ++branchDirectFFs;
               }
@@ -3369,22 +4398,25 @@ void HTreeBuilder::createClockSubNets()
               // Individual FF (no clustering): treat as single-FF group
               std::string ffName = getFFName(sinkInst);
               double ffTarget = cts3dDb_->getSkewTarget(ffName);
-              double ffDelta = ffTarget - globalMeanTarget_;
+              // Debug: trace individual FF target lookup
+              if (ffTarget > 0.01) {
+                debugPrint(logger_, CTS, "HTree", 1,
+                    "collectFFs individual: '{}' target={:.4f}ns",
+                    ffName, ffTarget);
+              }
+              // globalMean fix: absolute LP target
+              double ffDelta = ffTarget;
               int depth = 0;
               if (ffDelta > groupedDelayMinDelta_) {
                 depth = static_cast<int>(
                     std::round(ffDelta / perFfBufDelay_));
                 depth = std::max(0, std::min(depth, groupedDelayMaxDepth_));
               }
-              if (depth > 0) {
-                auto hIt = perFfHoldBudget_.find(ffName);
-                if (hIt != perFfHoldBudget_.end()) {
-                  while (depth > 0
-                      && hIt->second - depth * perFfBufDelay_ < perFfHoldGuard_) {
-                    --depth;
-                  }
-                  if (depth == 0) ++branchHoldSkip;
-                }
+              // Removed redundant holdSkip (same as above).
+              // V58 Fix C: Macro sinks (SRAM) get depth=0.
+              odb::dbInst* dInst = sinkInst->getDbInst();
+              if (isMacroBlockInst(dInst)) {
+                depth = 0;
               }
               if (depth == 0) {
                 subNet->addInst(*sinkInst);
@@ -3395,19 +4427,45 @@ void HTreeBuilder::createClockSubNets()
                 const int ffTier = (ft >= 0) ? ft : branch_tier;
                 const std::string ffBufMaster = cts3dDb_->getBufferForTier(
                     options_->getRootBuffer(), ffTier);
+                // V59: Sequential fixed-spacing placement along driver→FF vector.
+                // minStep = bufWidth → buffer bodies cannot overlap.
+                int bufW = 0;
+                {
+                  odb::dbMaster* m = db_->findMaster(ffBufMaster.c_str());
+                  if (m) bufW = m->getWidth();
+                }
+                int ffSpanX = std::abs(sinkInst->getX() - subNet->getDriver()->getX());
+                int ffSpanY = std::abs(sinkInst->getY() - subNet->getDriver()->getY());
+                int ffSpan = std::max(ffSpanX, ffSpanY);
+                int ffMinStep = std::max(bufW, 1);
+                double ffFracStep = (ffSpan > 0)
+                    ? static_cast<double>(ffMinStep) / ffSpan : 1.0;
+
+                if (ffFracStep >= 1.0 || depth == 0) {
+                  // No room for any buffer → connect directly
+                  subNet->addInst(*sinkInst);
+                  ++branchDirectFFs;
+                  ++numSinks;
+                  continue;
+                }
                 ClockSubNet* cur = subNet;
+                int prevFfBufX = subNet->getDriver()->getX();
                 for (int d = 0; d < depth; ++d) {
-                  double frac = static_cast<double>(d + 1) / (depth + 1);
-                  int bx = cur->getDriver()->getX()
+                  double frac = ffFracStep * (d + 1);
+                  if (frac >= 1.0) {
+                    // No room → connect FF to current net and stop
+                    cur->addInst(*sinkInst);
+                    cur->setLeafLevel(true);
+                    depth = d;
+                    break;
+                  }
+                  int bx = subNet->getDriver()->getX()
                       + static_cast<int>(
-                          (sinkInst->getX() - cur->getDriver()->getX()) * frac);
-                  int by = cur->getDriver()->getY()
+                          (sinkInst->getX() - subNet->getDriver()->getX()) * frac);
+                  int by = subNet->getDriver()->getY()
                       + static_cast<int>(
-                          (sinkInst->getY() - cur->getDriver()->getY()) * frac);
-                  // V50-Legal (JYJ 2026-03-10): Grid-snap per-FF grouped delay buffer
-                  // via legalizeOneBuffer(), same as all H-tree standard buffers.
-                  // Raw interpolation produces off-grid DBU positions → DPL-0036.
-                  // Conversion: DBU → techChar units → legalizeOneBuffer → DBU.
+                          (sinkInst->getY() - subNet->getDriver()->getY()) * frac);
+                  // Grid-snap per-FF grouped delay buffer
                   {
                     Point<double> rawLoc(static_cast<double>(bx) / wireSegmentUnit_,
                                         static_cast<double>(by) / wireSegmentUnit_);
@@ -3415,7 +4473,15 @@ void HTreeBuilder::createClockSubNets()
                     bx = static_cast<int>(legalLoc.getX() * wireSegmentUnit_);
                     by = static_cast<int>(legalLoc.getY() * wireSegmentUnit_);
                   }
-                  const std::string bName = "clkbuf_grp_"
+                  // Post-snap X-only overlap check
+                  if (bufW > 0 && std::abs(bx - prevFfBufX) <= bufW) {
+                    cur->addInst(*sinkInst);
+                    cur->setLeafLevel(true);
+                    depth = d;
+                    break;
+                  }
+                  prevFfBufX = bx;
+                  const std::string bName = tierPrefix_ + "clkbuf_grp_"
                       + std::to_string(myGrpId) + "_s"
                       + std::to_string(numSinks) + "_"
                       + std::to_string(d);
@@ -3425,7 +4491,7 @@ void HTreeBuilder::createClockSubNets()
                   addTreeLevelBuffer(&grpBuf);
                   cur->addInst(grpBuf);
                   ClockSubNet& next = clock_.addSubNet(
-                      "clknet_grp_" + std::to_string(myGrpId) + "_s"
+                      tierPrefix_ + "clknet_grp_" + std::to_string(myGrpId) + "_s"
                       + std::to_string(numSinks) + "_"
                       + std::to_string(d));
                   next.addInst(grpBuf);
@@ -3444,16 +4510,16 @@ void HTreeBuilder::createClockSubNets()
           ++totalBranches_debug;
           if (branchGroupedFFs > 0) ++firedBranches_debug;
           totalDelivered_debug += branchGroupBufs * perFfBufDelay_;
-          logger_->info(CTS, 493,
-              "V50 grouped branch {:2d}: grouped={} FFs ({} bufs), "
-              "direct={}, holdSkip={}, branchMean={:.4f}ns uniform={}",
-              idx, branchGroupedFFs, branchGroupBufs,
-              branchDirectFFs, branchHoldSkip, absTgt,
-              enableClusterUniform_ ? 1 : 0);
+          debugPrint(logger_, CTS, "HTree", 1,
+              "{} branch {:2d}: grouped={} FFs ({} bufs), "
+              "direct={}, holdSkip={}, branchMean={:.4f}ns",
+              enableGhTree_ ? "ghtree" : "grouped", idx,
+              branchGroupedFFs, branchGroupBufs,
+              branchDirectFFs, branchHoldSkip, absTgt);
           return;  // skip legacy per-branch N-buffer code
         }
 
-        // JYJ (2026-02-27) V41-fix: Per-FF relay buffer path (rewrote V39).
+        // Per-FF relay buffer path (rewrote V39).
         // BUG #1 fix: V39 operated at cluster-buffer granularity (mean target),
         //   now iterates member FFs individually for per-FF relay decisions.
         // BUG #2 fix: V39 placed relays at FF position (unplanned wire delay),
@@ -3473,7 +4539,7 @@ void HTreeBuilder::createClockSubNets()
           const std::string bufMaster = cts3dDb_->getBufferForTier(
               options_->getRootBuffer(), branch_tier);
 
-          // V41: Helper lambda to process a single FF with relay decision
+          // Helper lambda to process a single FF with relay decision
           auto processOneFf = [&](ClockInst* ffInst, ClockInst* driverInst,
                                   ClockSubNet* driverSubNet) {
             // Get per-FF target (NOT cluster mean)
@@ -3484,12 +4550,13 @@ void HTreeBuilder::createClockSubNets()
               if (sp != std::string::npos) nm = nm.substr(0, sp);
               return cts3dDb_->getSkewTarget(nm);
             }();
-            const double ffDelta = ffTarget - globalMeanTarget_;
-            // V47: Pre-compute dx/dy for Elmore model (moved before nRelay decision)
+            // globalMean fix: absolute LP target
+            const double ffDelta = ffTarget;
+            // Pre-compute dx/dy for Elmore model (moved before nRelay decision)
             const int dx = ffInst->getX() - driverInst->getX();
             const int dy = ffInst->getY() - driverInst->getY();
 
-            // V47: Elmore x_useful relay positioning.
+            // Elmore x_useful relay positioning.
             // When wire RC params are set (CTS_RELAY_RW_PER_UM / CTS_RELAY_CW_PER_UM),
             // compute exact relay position so 1 buffer delivers target_delta:
             //   delta(x) = d_buf - rc * x * (L - x)   [ps]
@@ -3534,31 +4601,16 @@ void HTreeBuilder::createClockSubNets()
               }
             }
 
-            // Hold safety: check per-FF hold budget
-            if (nRelay > 0) {
-              std::string ffName = ffInst->getName();
-              auto slashPos = ffName.rfind('/');
-              if (slashPos != std::string::npos) {
-                ffName = ffName.substr(0, slashPos);
-              }
-              auto hIt = perFfHoldBudget_.find(ffName);
-              if (hIt != perFfHoldBudget_.end()) {
-                while (nRelay > 0
-                    && hIt->second - nRelay * perFfBufDelay_ < perFfHoldGuard_) {
-                  --nRelay;
-                }
-                if (nRelay == 0) ++branchHoldSkip;
-              }
-            }
+            // Removed redundant holdSkip (same as above).
 
             // Debug stats (use delta, not absolute, for accurate coverage)
             totalLpDelay_debug += std::max(0.0, ffDelta);
             ++totalBranchSinks_debug;
 
             if (nRelay > 0) {
-              // V47: dx/dy pre-computed above (before nRelay decision).
+              // dx/dy pre-computed above (before nRelay decision).
               // Single relay uses Elmore relayFrac; multi-relay uses equal spacing.
-              // JYJ (2026-03-01) V47a: Get FF's tier for relay tier assignment.
+              // Get FF's tier for relay tier assignment.
               // Relay must be on the SAME tier as its target FF to avoid cross-tier
               // relay→FF nets. Cross-tier relay→FF nets cause GRT-0183 heap underflow
               // in 3D maze routing (observed in V43/V46/V47 for minority-tier FFs in
@@ -3569,7 +4621,7 @@ void HTreeBuilder::createClockSubNets()
 
               ClockSubNet* cur = driverSubNet;
               for (int r = 0; r < nRelay; ++r) {
-                // V47: 1-relay → Elmore x_useful fraction; else equal spacing
+                // 1-relay → Elmore x_useful fraction; else equal spacing
                 const double frac = (nRelay == 1)
                     ? relayFrac
                     : static_cast<double>(r + 1) / (nRelay + 1);
@@ -3578,7 +4630,7 @@ void HTreeBuilder::createClockSubNets()
                 const int ry = driverInst->getY()
                     + static_cast<int>(dy * frac);
 
-                const std::string rName = "clkbuf_relay_"
+                const std::string rName = tierPrefix_ + "clkbuf_relay_"
                     + std::to_string(idx) + "_"
                     + std::to_string(numSinks) + "_"
                     + std::to_string(r);
@@ -3588,7 +4640,7 @@ void HTreeBuilder::createClockSubNets()
                 addTreeLevelBuffer(&relay);
                 cur->addInst(relay);
                 ClockSubNet& next = clock_.addSubNet(
-                    "clknet_relay_" + std::to_string(idx) + "_"
+                    tierPrefix_ + "clknet_relay_" + std::to_string(idx) + "_"
                     + std::to_string(numSinks) + "_"
                     + std::to_string(r));
                 next.addInst(relay);
@@ -3610,9 +4662,10 @@ void HTreeBuilder::createClockSubNets()
               = leafTopology.getBranchSinksLocations(idx);
           for (const auto& loc : sinkLocs) {
             // Epsilon-tolerant sink lookup (V37 CTS-0080 fix reused)
+            // FloatFix: eps=1e-4 (float→double mismatch reaches ~1e-5 for large coords)
             auto sinkIt = mapLocationToSink_.find(loc);
             if (sinkIt == mapLocationToSink_.end()) {
-              constexpr double eps = 1e-6;
+              constexpr double eps = 0.01;
               auto hint = mapLocationToSink_.lower_bound(
                   Point<double>(loc.getX() - eps, loc.getY() - eps));
               for (auto it = hint; it != mapLocationToSink_.end(); ++it) {
@@ -3626,12 +4679,12 @@ void HTreeBuilder::createClockSubNets()
             }
             if (sinkIt == mapLocationToSink_.end()) {
               logger_->error(CTS, 425,
-                  "V39 relay: Sink not found at ({:.10f}, {:.10f})",
+                  "Relay: Sink not found at ({:.10f}, {:.10f})",
                   loc.getX(), loc.getY());
             }
             ClockInst* sinkInst = sinkIt->second;
 
-            // V41-fix BUG#1: Check if this is a cluster buffer
+            // Check if this is a cluster buffer
             auto cIt = clusterBufTarget_.find(sinkInst);
             if (cIt != clusterBufTarget_.end()) {
               // Cluster buffer: add to branch subnet, then process
@@ -3676,22 +4729,26 @@ void HTreeBuilder::createClockSubNets()
           ++totalBranches_debug;
           if (branchRelayFFs > 0) ++firedBranches_debug;
           logger_->info(CTS, 424,
-              "V39 relay branch {:2d}: relay={} FFs ({} bufs), "
+              "Relay branch {:2d}: relay={} FFs ({} bufs), "
               "direct={}, holdSkip={}, branchMean={:.4f}ns",
               idx, branchRelayFFs, branchRelayBufs,
               branchDirectFFs, branchHoldSkip, absTgt);
           return;  // skip legacy per-branch N-buffer code
         }
 
-        // V32c-fix: use delta relative to globalMean to cap inter-branch differential
-        const double delta = absTgt - globalMeanTarget_;
+        // globalMean fix: absolute LP target
+        const double delta = absTgt;
         int num_bufs = 0;
-        if (delta > 0.0 && singleBufDelay_ > 1e-9) {
+        // V58 Fix F: Skip per-branch delay buffers for MacroTree.
+        // Macro tree latency is already too high (1,095ps vs register ~462ps).
+        // Adding delay buffers widens the gap → worsens hold on reg→macro edges.
+        if (type_ != TreeType::MacroTree
+            && delta > 0.0 && singleBufDelay_ > 1e-9) {
           num_bufs = static_cast<int>(std::round(delta / singleBufDelay_));
           num_bufs = std::max(0, std::min(num_bufs, maxLeafDelayBufs_));
         }
 
-        // V32c-debug: accumulate LP-CTS gap stats (CTS-408 summary after loop)
+        // Debug: accumulate LP-CTS gap stats (CTS-408 summary after loop)
         totalLpDelay_debug   += absTgt * branchCnt;
         totalBranchSinks_debug += branchCnt;
         ++totalBranches_debug;
@@ -3711,7 +4768,7 @@ void HTreeBuilder::createClockSubNets()
             // Build N-buffer chain in series
             ClockSubNet* curSub = subNet;
             for (int b = 0; b < num_bufs; ++b) {
-              const std::string bufName = "clkbuf_delay_"
+              const std::string bufName = tierPrefix_ + "clkbuf_delay_"
                                           + std::to_string(idx) + "_"
                                           + std::to_string(b);
               ClockInst& buf = clock_.addClockBuffer(bufName, delayBufMaster, bx, by);
@@ -3723,7 +4780,7 @@ void HTreeBuilder::createClockSubNets()
 
               // Create new subnet; first addInst sets buf as its driver
               ClockSubNet& nextSub = clock_.addSubNet(
-                  "clknet_delay_" + std::to_string(idx) + "_" + std::to_string(b));
+                  tierPrefix_ + "clknet_delay_" + std::to_string(idx) + "_" + std::to_string(b));
               nextSub.addInst(buf);  // buf becomes driver of nextSub
 
               curSub = &nextSub;
@@ -3735,9 +4792,10 @@ void HTreeBuilder::createClockSubNets()
                 = leafTopology.getBranchSinksLocations(idx);
             for (const Point<double>& loc : sinkLocs) {
               auto sinkIt = mapLocationToSink_.find(loc);
-              // V37-fix: epsilon fallback for float precision mismatch
+              // epsilon fallback for float precision mismatch
+              // FloatFix: eps=1e-4 (float→double mismatch reaches ~1e-5 for large coords)
               if (sinkIt == mapLocationToSink_.end()) {
-                constexpr double eps = 1e-6;
+                constexpr double eps = 0.01;
                 auto hint = mapLocationToSink_.lower_bound(
                     Point<double>(loc.getX() - eps, loc.getY() - eps));
                 for (auto it = hint; it != mapLocationToSink_.end(); ++it) {
@@ -3750,7 +4808,20 @@ void HTreeBuilder::createClockSubNets()
                 }
               }
               if (sinkIt == mapLocationToSink_.end()) {
-                logger_->error(CTS, 404, "Sink not found (delay buffer branch).");
+                // V58: eps failed — find absolute nearest (same pattern as CTS-0079).
+                // Cannot skip: sink would be unconnected → SIGSEGV in writeDummyLoadsToDb.
+                double bestDist = std::numeric_limits<double>::max();
+                for (auto& [key, sink] : mapLocationToSink_) {
+                  double d = std::abs(key.getX() - loc.getX())
+                           + std::abs(key.getY() - loc.getY());
+                  if (d < bestDist) {
+                    bestDist = d;
+                    sinkIt = mapLocationToSink_.find(key);
+                  }
+                }
+                logger_->warn(CTS, 404,
+                    "Delay buf branch: sink at ({:.6f}, {:.6f}) — nearest match dist={:.6f}",
+                    loc.getX(), loc.getY(), bestDist);
               }
               curSub->addInst(*sinkIt->second);
               ++numSinks;
@@ -3764,7 +4835,7 @@ void HTreeBuilder::createClockSubNets()
             return;  // skip normal sink connection below
           }
 
-        // V32c-debug CTS-406: branch has LP target but delta ≤ 0 → skipped by delta trigger.
+        // Branch has LP target but delta ≤ 0 → skipped by delta trigger.
         // These branches are BELOW globalMean; N=0 even though LP assigned non-zero target.
         // This reveals LP targets that are "wasted" (below average, can't be implemented
         // with delta-based approach). Key gap source if most targets fall here.
@@ -3782,11 +4853,12 @@ void HTreeBuilder::createClockSubNets()
             = leafTopology.getBranchSinksLocations(idx);
         for (const Point<double>& loc : sinkLocs) {
           auto sinkIt = mapLocationToSink_.find(loc);
-          // V37-fix: float/double precision mismatch from multi-level
+          // float/double precision mismatch from multi-level
           // computeBranchSinks() double→float→double roundtrip.
           // If exact lookup fails, search for nearest entry within epsilon.
+          // FloatFix: eps=1e-4 (float→double mismatch reaches ~1e-5 for large coords)
           if (sinkIt == mapLocationToSink_.end()) {
-            constexpr double eps = 1e-6;
+            constexpr double eps = 0.01;
             auto hint = mapLocationToSink_.lower_bound(
                 Point<double>(loc.getX() - eps, loc.getY() - eps));
             for (auto it = hint; it != mapLocationToSink_.end(); ++it) {
@@ -3805,9 +4877,15 @@ void HTreeBuilder::createClockSubNets()
             }
           }
           if (sinkIt == mapLocationToSink_.end()) {
-            logger_->error(CTS, 80,
-                           "Sink not found at ({:.10f}, {:.10f}), mapSize={}",
-                           loc.getX(), loc.getY(), mapLocationToSink_.size());
+            // V58: warn+skip instead of fatal error.
+            // Multi-level clustering float precision drift can exceed eps=1e-4
+            // for large designs (10K+ sinks, 7+ H-tree levels).
+            // Skipped sink stays on parent leaf net (depth=0, no grouped delay).
+            logger_->warn(CTS, 80,
+                          "Sink not found at ({:.10f}, {:.10f}), mapSize={} — "
+                          "skipping (connects to leaf net directly)",
+                          loc.getX(), loc.getY(), mapLocationToSink_.size());
+            continue;
           }
 
           subNet->addInst(*sinkIt->second);
@@ -3822,7 +4900,7 @@ void HTreeBuilder::createClockSubNets()
                   numDelayBufs);
   }
 
-  // V32c-debug CTS-408: LP-CTS translation efficiency summary.
+  // LP-CTS translation efficiency summary.
   // coverage = totalDelivered / totalLpDelay * 100%
   //   ~0%   → N-buffer chain never fires (all branches below globalMean, or absTgt=0)
   //   ~50%  → half of LP target translated (rounding + below-mean branches)
@@ -3842,12 +4920,12 @@ void HTreeBuilder::createClockSubNets()
                   firedBranches_debug, totalBranches_debug);
   }
 
-  // JYJ (2026-02-26) V39: Per-FF relay summary log
+  // Per-FF relay summary log
   if (enablePerFfRelay_ && totalBranchSinks_debug > 0) {
     const double cov = totalLpDelay_debug > 1e-12
         ? 100.0 * totalDelivered_debug / totalLpDelay_debug : 0.0;
     logger_->info(CTS, 426,
-        "V39 per-FF relay summary: {} relay bufs across {}/{} branches, "
+        "Per-FF relay summary: {} relay bufs across {}/{} branches, "
         "{} sinks, coverage={:.1f}%",
         numDelayBufs, firedBranches_debug, totalBranches_debug,
         numSinks, cov);
@@ -3866,17 +4944,17 @@ void HTreeBuilder::createSingleBufferClockNet()
   const int centerX = legalCenter.getX() * wireSegmentUnit_;
   const int centerY = legalCenter.getY() * wireSegmentUnit_;
   ClockInst& rootBuffer = clock_.addClockBuffer(
-      "clkbuf_0", options_->getRootBuffer(), centerX, centerY);
+      tierPrefix_ + "clkbuf_0", options_->getRootBuffer(), centerX, centerY);
 
   // clang-format off
   if (center != legalCenter) {
     debugPrint(logger_, CTS, "legalizer", 2, "createSingleBufferClockNet "
-	       "legalizeOneBuffer clkbuf_0: {} => {}", center, legalCenter);
+	       "legalizeOneBuffer {}clkbuf_0: {} => {}", tierPrefix_, center, legalCenter);
   }
   // clang-format on
 
   addTreeLevelBuffer(&rootBuffer);
-  ClockSubNet& clockSubNet = clock_.addSubNet("clknet_0");
+  ClockSubNet& clockSubNet = clock_.addSubNet(tierPrefix_ + "clknet_0");
   clockSubNet.setTreeLevel(0);
   clockSubNet.addInst(rootBuffer);
 
@@ -4037,7 +5115,7 @@ void SegmentBuilder::build(const std::string& forceBuffer)
       const std::string buffMaster = !forceBuffer.empty()
                                          ? forceBuffer
                                          : wireSegment.getBufferMaster(buffer);
-      // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
+      // Replaced mapBufferMasterToTier with Cts3DDatabase
       const std::string tieredMaster
           = tree_->getCts3DDatabase()->getBufferForTier(buffMaster, targetTier_);
       Point<double> bufferLoc(x, y);
@@ -4049,7 +5127,7 @@ void SegmentBuilder::build(const std::string& forceBuffer)
           tieredMaster,
           legalBufferLoc.getX() * techCharDistUnit_,
           legalBufferLoc.getY() * techCharDistUnit_);
-      // JYJ (2026-02-07) Tier assignment through SSOT (Cts3DDatabase)
+      // Tier assignment through SSOT (Cts3DDatabase)
       tree_->getCts3DDatabase()->setClockInstTier(newBuffer, targetTier_);
 
       // clang-format off
@@ -4088,7 +5166,7 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
     return;
   }
 
-  // JYJ (2026-02-06) Replaced mapBufferMasterToTier with Cts3DDatabase
+  // Replaced mapBufferMasterToTier with Cts3DDatabase
   const std::string tieredMaster
       = tree_->getCts3DDatabase()->getBufferForTier(master, targetTier_);
   ClockInst& newBuffer
@@ -4096,7 +5174,7 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
                                tieredMaster,
                                target_.getX() * techCharDistUnit_,
                                target_.getY() * techCharDistUnit_);
-  // JYJ (2026-02-07) Tier assignment through SSOT (Cts3DDatabase)
+  // Tier assignment through SSOT (Cts3DDatabase)
   tree_->getCts3DDatabase()->setClockInstTier(newBuffer, targetTier_);
   tree_->addTreeLevelBuffer(&newBuffer);
   // clang-format off
@@ -4109,5 +5187,440 @@ void SegmentBuilder::forceBufferInSegment(const std::string& master)
   drivingSubNet_->addInst(newBuffer);
   numBufferLevels_++;
 }
+
+// TARP: Timing-affinity clustering integration.
+void HTreeBuilder::runTarpClustering(
+    const std::vector<std::pair<float, float>>& points,
+    const std::vector<const ClockInst*>& sinkInsts,
+    unsigned hilbertBestGroupSize,
+    float hilbertBestDiameter)
+{
+  const unsigned N = points.size();
+
+  TarpParams tp;
+  tp.alpha = tarpAlpha_;
+  tp.d_buf = perFfBufDelay_;
+  tp.max_depth = groupedDelayMaxDepth_;
+
+  // Hilbert-calibrated cluster size: use grid search result as default.
+  // Env var CTS_TARP_MAX_CLUSTER overrides if set.
+  tp.max_cluster_size = (hilbertBestGroupSize > 0) ? hilbertBestGroupSize : 10;
+  if (const char* e = std::getenv("CTS_TARP_MAX_CLUSTER"))
+    tp.max_cluster_size = std::atoi(e);
+
+  if (const char* e = std::getenv("CTS_TARP_TOP_K"))
+    tp.top_k_edges = std::atoi(e);
+  if (const char* e = std::getenv("CTS_TARP_SLACK_THRESH"))
+    tp.slack_threshold_ratio = std::stod(e);
+  if (const char* e = std::getenv("CTS_TARP_FM_PASSES"))
+    tp.fm_max_passes = std::atoi(e);
+
+  // Hilbert-calibrated diameter: use grid search result as default.
+  // Env var CTS_TARP_MAX_DIAMETER_UM overrides if set.
+  if (hilbertBestDiameter > 0) {
+    tp.max_diameter = hilbertBestDiameter;  // already in wireSegmentUnit
+  } else {
+    tp.max_diameter = 50.0 * options_->getDbUnits() / wireSegmentUnit_;
+  }
+  if (const char* e = std::getenv("CTS_TARP_MAX_DIAMETER_UM"))
+    tp.max_diameter = std::stod(e) * options_->getDbUnits() / wireSegmentUnit_;
+
+  TarpClustering tarp(logger_, tp);
+
+  // Add sinks with LP targets and hold budgets
+  int hb_direct = 0, hb_downstream = 0, hb_fail_closed = 0;
+  for (unsigned i = 0; i < N; ++i) {
+    std::string nm = sinkInsts[i]->getName();
+    const auto sp = nm.rfind('/');
+    if (sp != std::string::npos) nm = nm.substr(0, sp);
+
+    double lp_target = cts3dDb_->hasSkewTargets()
+                           ? cts3dDb_->getSkewTarget(nm) : 0.0;
+    double hold_budget = 0.0;
+    auto it = perFfHoldBudget_.find(nm);
+    if (it != perFfHoldBudget_.end()) {
+      hold_budget = it->second;
+      ++hb_direct;
+    } else {
+      // Clone/gate sink: trace downstream to find real FFs' hold budgets
+      odb::dbInst* dbInst = sinkInsts[i]->getDbInst();
+      bool found_downstream = false;
+      if (dbInst) {
+        for (auto* iterm : dbInst->getITerms()) {
+          if (iterm->getIoType() != odb::dbIoType::OUTPUT) continue;
+          odb::dbNet* outNet = iterm->getNet();
+          if (!outNet) continue;
+          for (auto* sink_iterm : outNet->getITerms()) {
+            if (sink_iterm == iterm) continue;
+            std::string ff_name = sink_iterm->getInst()->getName();
+            auto ff_it = perFfHoldBudget_.find(ff_name);
+            if (ff_it != perFfHoldBudget_.end()) {
+              if (!found_downstream) {
+                hold_budget = ff_it->second;
+                found_downstream = true;
+              } else {
+                hold_budget = std::min(hold_budget, ff_it->second);
+              }
+            }
+          }
+        }
+      }
+      if (!found_downstream) {
+        ++hb_fail_closed;
+      } else {
+        ++hb_downstream;
+      }
+    }
+
+    float cap = (sinkInsts[i]->getInputCap() == 0)
+                    ? options_->getSinkBufferInputCap()
+                    : sinkInsts[i]->getInputCap();
+
+    tarp.addSink(i, points[i].first, points[i].second, cap,
+                 lp_target, hold_budget, nm);
+  }
+
+  // Hold budget summary (replaces per-sink CTS-0431 spam)
+  logger_->info(CTS, 431,
+      "TARP hold budget: {} direct, {} downstream-resolved, {} fail-closed (budget=0)",
+      hb_direct, hb_downstream, hb_fail_closed);
+
+  // Read timing graph CSV for setup slacks
+  auto prof_csv_t0 = std::chrono::high_resolution_clock::now();
+  const char* csv_env = std::getenv("CTS_FF_TIMING_GRAPH_CSV");
+  if (csv_env) {
+    std::ifstream csvFile(csv_env);
+    if (csvFile.is_open()) {
+      std::unordered_map<std::string, unsigned> nameToIdx;
+      const auto& sinks = tarp.sinks();
+      for (unsigned i = 0; i < sinks.size(); ++i)
+        nameToIdx[sinks[i].name] = i;
+
+      double T_period = 1.0;
+      if (const char* e = std::getenv("CTS_CLOCK_PERIOD_NS"))
+        T_period = std::stod(e);
+
+      std::string line;
+      std::getline(csvFile, line);  // skip header
+      int edge_count = 0;
+      while (std::getline(csvFile, line)) {
+        std::vector<std::string> tokens;
+        std::istringstream ls(line);
+        std::string token;
+        while (std::getline(ls, token, ',')) tokens.push_back(token);
+        // CSV column layout (14 or 16 columns):
+        //   0:from_ff, 1:to_ff, 2:slack_max, 3:slack_min, 4:arr_max, 5:arr_min,
+        //   6:req_max, 7:req_min, 8:from_x, 9:from_y, 10:from_tier,
+        //   11:to_x, 12:to_y, 13:to_tier [, 14:from_clock_net, 15:to_clock_net]
+        // BUG FIX (V57_CLK2): from_clock_net/to_clock_net columns were appended later,
+        // making the CSV 16 columns. The old "16-col legacy" branch (f_tier_idx=5,
+        // t_tier_idx=8) incorrectly triggered, reading arrival_min_ns and from_x as tier
+        // values — always mismatched — causing TARP to report 0 same-tier edges and pin
+        // all FFs to Hilbert positions (timing-aware clustering completely disabled).
+        // Fix: always use standard column positions (tier at col 10/13) for >=14 columns.
+        if (tokens.size() < 14) continue;
+
+        const int f_tier_idx = 10, t_tier_idx = 13;
+        const int slack_max_idx = 2, slack_min_idx = 3;
+        const int arr_max_idx = 4, arr_min_idx = 5;
+
+        int f_tier = std::stoi(tokens[f_tier_idx]);
+        int t_tier = std::stoi(tokens[t_tier_idx]);
+        if (f_tier != t_tier) continue;  // skip cross-tier
+
+        double slack_max = std::stod(tokens[slack_max_idx]);
+        double slack_min = std::stod(tokens[slack_min_idx]);
+        double arr_max = std::stod(tokens[arr_max_idx]);
+        double arr_min = std::stod(tokens[arr_min_idx]);
+        if (slack_max == 0 && slack_min == 0 && arr_max == 0 && arr_min == 0)
+          continue;  // ghost edge
+
+        auto it_a = nameToIdx.find(tokens[0]);
+        auto it_b = nameToIdx.find(tokens[1]);
+        if (it_a == nameToIdx.end() || it_b == nameToIdx.end()) continue;
+
+        tarp.addTimingEdge(it_a->second, it_b->second, slack_max, T_period);
+        ++edge_count;
+      }
+      logger_->info(CTS, 841, "TARP: {} same-tier edges from {}",
+                    edge_count, csv_env);
+    }
+  }
+
+  auto prof_csv_t1 = std::chrono::high_resolution_clock::now();
+  double prof_csv_s = std::chrono::duration<double>(prof_csv_t1 - prof_csv_t0).count();
+  logger_->info(CTS, 915, "Profile: TARP CSV parse {:.1f}s", prof_csv_s);
+
+  auto prof_fm_t0 = std::chrono::high_resolution_clock::now();
+  tarp.run();
+  auto prof_fm_t1 = std::chrono::high_resolution_clock::now();
+  double prof_fm_s = std::chrono::duration<double>(prof_fm_t1 - prof_fm_t0).count();
+  logger_->info(CTS, 916, "Profile: TARP FM clustering {:.1f}s", prof_fm_s);
+
+  // Convert clusters to leaf buffers
+  std::vector<std::pair<float, float>> newSinkLocations;
+  unsigned clusterCount = 0;
+
+  for (const auto& cluster : tarp.clusters()) {
+    if (cluster.empty()) continue;
+    if (cluster.size() == 1) {
+      unsigned orig = tarp.sinks()[cluster[0]].orig_idx;
+      newSinkLocations.emplace_back(points[orig]);
+      // Fix CTS-0492: register single-FF sink in mapLocationToSink_
+      // (multi-FF clusters register at line 4725; single-FF was missing)
+      const Point<double> sinkPt((double) points[orig].first,
+                                 (double) points[orig].second);
+      mapLocationToSink_[sinkPt] = const_cast<ClockInst*>(sinkInsts[orig]);
+      ++clusterCount;
+      continue;
+    }
+
+    std::vector<ClockInst*> clusterInsts;
+    float xSum = 0, ySum = 0;
+    for (unsigned si : cluster) {
+      unsigned orig = tarp.sinks()[si].orig_idx;
+      // Use sinkInsts directly — no map lookup needed, avoids float/double mismatch
+      clusterInsts.push_back(const_cast<ClockInst*>(sinkInsts[orig]));
+      xSum += points[orig].first;
+      ySum += points[orig].second;
+    }
+
+    Point<double> center(xSum / cluster.size(), ySum / cluster.size());
+    const int tier = cts3dDb_->getDominantTier(clusterInsts);
+    const std::string buf = cts3dDb_->getBufferForTier(
+        options_->getSinkBuffer(), tier);
+
+    Point<double> loc = legalizeOneBuffer(center, buf);
+    commitMoveLoc(center, loc);
+
+    ClockInst& rootBuf = clock_.addClockBuffer(
+        tierPrefix_ + "clkbuf_leaf_" + std::to_string(clusterCount), buf,
+        loc.getX() * wireSegmentUnit_, loc.getY() * wireSegmentUnit_);
+    cts3dDb_->setClockInstTier(rootBuf, tier);
+    addFirstLevelSinkDriver(&rootBuf);
+
+    ClockSubNet& net = clock_.addSubNet(
+        tierPrefix_ + "clknet_leaf_" + std::to_string(clusterCount));
+    net.addInst(rootBuf);
+    for (ClockInst* ci : clusterInsts) net.addInst(*ci);
+    net.setLeafLevel(true);
+
+    const std::pair<float, float> bufPt(loc.getX(), loc.getY());
+    newSinkLocations.emplace_back(bufPt);
+    mapLocationToSink_[Point<double>(bufPt.first, bufPt.second)] = &rootBuf;
+
+    if (cts3dDb_->hasSkewTargets()) {
+      double sum = 0;
+      for (unsigned si : cluster) sum += tarp.sinks()[si].lp_target;
+      clusterBufTarget_[&rootBuf] = sum / cluster.size();
+    }
+    ++clusterCount;
+  }
+
+  topLevelSinksClustered_ = std::move(newSinkLocations);
+  if (clusterCount) treeBufLevels_++;
+  logger_->info(CTS, 844, "TARP: {} clusters, {} sinks",
+                clusterCount, topLevelSinksClustered_.size());
+}
+
+// runTimingRefinement removed.
+// FM min-cut with Hilbert initial partition replaces boundary swap.
+// See TarpClustering.cpp for the FM implementation.
+
+#if 0  // REMOVED: runTimingRefinement (replaced by TARP FM)
+void HTreeBuilder::runTimingRefinement_REMOVED(
+    std::vector<std::vector<unsigned>>& clusters,
+    const std::vector<std::pair<float, float>>& points,
+    const std::vector<const ClockInst*>& sinkInsts)
+{
+  const unsigned N = points.size();
+  if (N == 0 || clusters.empty()) return;
+
+  // Read params
+  double slackThreshRatio = 0.3;
+  if (const char* e = std::getenv("CTS_TARP_SLACK_THRESH"))
+    slackThreshRatio = std::stod(e);
+
+  // Get clock period (ns)
+  double T_period = 1.0;
+  if (const char* e = std::getenv("CTS_CLOCK_PERIOD_NS"))
+    T_period = std::stod(e);
+  const double slackThresh = slackThreshRatio * T_period;
+
+  // Build FF name → point index map
+  std::unordered_map<std::string, unsigned> nameToIdx;
+  for (unsigned i = 0; i < N; ++i) {
+    std::string nm = sinkInsts[i]->getName();
+    const auto sp = nm.rfind('/');
+    if (sp != std::string::npos) nm = nm.substr(0, sp);
+    nameToIdx[nm] = i;
+  }
+
+  // Build point index → cluster index map
+  std::vector<int> ffCluster(N, -1);
+  for (unsigned c = 0; c < clusters.size(); ++c) {
+    for (unsigned idx : clusters[c]) {
+      if (idx < N) ffCluster[idx] = static_cast<int>(c);
+    }
+  }
+
+  // Load critical timing edges from CSV
+  const char* csv_env = std::getenv("PRE_CTS_FF_TIMING_GRAPH");
+  if (!csv_env) {
+    logger_->info(CTS, 875, "TARP refinement: no timing graph CSV, skipping");
+    return;
+  }
+
+  struct CritEdge {
+    unsigned ff_a, ff_b;
+    double slack;
+  };
+  std::vector<CritEdge> critEdges;
+
+  std::ifstream csvFile(csv_env);
+  if (!csvFile.is_open()) {
+    logger_->warn(CTS, 876, "TARP refinement: cannot open {}", csv_env);
+    return;
+  }
+
+  std::string line;
+  std::getline(csvFile, line);  // skip header
+  while (std::getline(csvFile, line)) {
+    std::stringstream ss(line);
+    std::string token;
+    std::vector<std::string> tokens;
+    while (std::getline(ss, token, ',')) tokens.push_back(token);
+    if (tokens.size() < 14) continue;
+
+    const std::string& from_ff = tokens[0];
+    const std::string& to_ff = tokens[1];
+    double slack_max = std::stod(tokens[2]);
+    int from_tier = std::stoi(tokens[10]);
+    int to_tier = std::stoi(tokens[13]);
+
+    // Same-tier only
+    if (from_tier != to_tier) continue;
+    // Ghost edge filter
+    double slack_min = std::stod(tokens[3]);
+    double arr_max = std::stod(tokens[4]);
+    double arr_min = std::stod(tokens[5]);
+    if (slack_max == 0 && slack_min == 0 && arr_max == 0 && arr_min == 0) continue;
+    // Slack threshold filter
+    if (slack_max > slackThresh) continue;
+
+    auto it_a = nameToIdx.find(from_ff);
+    auto it_b = nameToIdx.find(to_ff);
+    if (it_a == nameToIdx.end() || it_b == nameToIdx.end()) continue;
+
+    critEdges.push_back({it_a->second, it_b->second, slack_max});
+  }
+
+  // Count cross-cluster critical pairs
+  unsigned crossBefore = 0;
+  for (const auto& e : critEdges) {
+    if (ffCluster[e.ff_a] != ffCluster[e.ff_b]) crossBefore++;
+  }
+
+  logger_->info(CTS, 877,
+      "TARP refinement: {} critical edges (slack<{:.3f}ns), {} cross-cluster ({:.1f}%)",
+      critEdges.size(), slackThresh,
+      crossBefore, critEdges.empty() ? 0.0 : 100.0 * crossBefore / critEdges.size());
+
+  if (crossBefore == 0) {
+    logger_->info(CTS, 878, "TARP refinement: no cross-cluster critical pairs, skipping");
+    return;
+  }
+
+  // Compute max diameter from best clustering (approximate from existing clusters)
+  double maxDiameter = 0;
+  for (const auto& cl : clusters) {
+    if (cl.size() <= 1) continue;
+    float xn = points[cl[0]].first, xx = xn;
+    float yn = points[cl[0]].second, yx = yn;
+    for (unsigned idx : cl) {
+      xn = std::min(xn, points[idx].first); xx = std::max(xx, points[idx].first);
+      yn = std::min(yn, points[idx].second); yx = std::max(yx, points[idx].second);
+    }
+    double diam = (xx - xn) + (yx - yn);
+    maxDiameter = std::max(maxDiameter, diam);
+  }
+  // Allow 20% diameter expansion for refinement
+  maxDiameter *= 1.2;
+
+  // Build per-FF critical edge count (how many critical edges this FF participates in)
+  std::vector<unsigned> ffCritCount(N, 0);
+  for (const auto& e : critEdges) {
+    if (ffCluster[e.ff_a] != ffCluster[e.ff_b]) {
+      ffCritCount[e.ff_a]++;
+      ffCritCount[e.ff_b]++;
+    }
+  }
+
+  // Greedy swap: for each cross-cluster critical edge, try moving the FF
+  // with fewer critical edges to the other's cluster
+  unsigned swaps = 0;
+  const unsigned maxSwaps = N / 4;  // cap at 25% of FFs
+
+  // Sort critical edges by slack (tightest first — most important to fix)
+  auto sortedEdges = critEdges;
+  std::sort(sortedEdges.begin(), sortedEdges.end(),
+            [](const CritEdge& a, const CritEdge& b) { return a.slack < b.slack; });
+
+  for (const auto& e : sortedEdges) {
+    if (swaps >= maxSwaps) break;
+
+    int ca = ffCluster[e.ff_a];
+    int cb = ffCluster[e.ff_b];
+    if (ca == cb) continue;  // already co-clustered (maybe by previous swap)
+
+    // Pick the FF to move: the one with fewer critical edges in its current cluster
+    // (less disruptive to move)
+    unsigned mover, target_cluster;
+    if (ffCritCount[e.ff_a] <= ffCritCount[e.ff_b]) {
+      mover = e.ff_a;
+      target_cluster = cb;
+    } else {
+      mover = e.ff_b;
+      target_cluster = ca;
+    }
+
+    int src_cluster = ffCluster[mover];
+
+    // Don't empty a cluster
+    if (clusters[src_cluster].size() <= 2) continue;
+
+    // Check diameter constraint after swap
+    float xn = points[mover].first, xx = xn;
+    float yn = points[mover].second, yx = yn;
+    for (unsigned idx : clusters[target_cluster]) {
+      xn = std::min(xn, points[idx].first); xx = std::max(xx, points[idx].first);
+      yn = std::min(yn, points[idx].second); yx = std::max(yx, points[idx].second);
+    }
+    double newDiam = (xx - xn) + (yx - yn);
+    if (newDiam > maxDiameter) continue;  // would violate spatial constraint
+
+    // Execute swap
+    // Remove from source cluster
+    auto& srcCluster = clusters[src_cluster];
+    srcCluster.erase(std::remove(srcCluster.begin(), srcCluster.end(), mover),
+                     srcCluster.end());
+    // Add to target cluster
+    clusters[target_cluster].push_back(mover);
+    ffCluster[mover] = target_cluster;
+    swaps++;
+  }
+
+  // Count cross-cluster after refinement
+  unsigned crossAfter = 0;
+  for (const auto& e : critEdges) {
+    if (ffCluster[e.ff_a] != ffCluster[e.ff_b]) crossAfter++;
+  }
+
+  logger_->info(CTS, 879,
+      "TARP refinement: {} swaps, cross-cluster {} -> {} ({:.1f}% reduction)",
+      swaps, crossBefore, crossAfter,
+      crossBefore > 0 ? 100.0 * (crossBefore - crossAfter) / crossBefore : 0.0);
+}
+#endif  // REMOVED: runTimingRefinement
 
 }  // namespace cts

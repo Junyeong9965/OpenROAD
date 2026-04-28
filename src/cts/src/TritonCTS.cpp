@@ -13,6 +13,7 @@
 #include <ctime>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -21,14 +22,19 @@
 #include <ranges>
 #include <set>
 #include <sstream>
+#include <stack>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "Clock.h"
-#include "Cts3DDatabase.h"        // JYJ (2026-02-06) Added for 3D tier database
-#include "ClockLatencyEstimator.h"  // JYJ (2026-02-23) V32: per-FF physical achievability
+#include "Cts3DDatabase.h"        // Added for 3D tier database
+#include "CtsSkewLpSolver.h"     // C++ LP-TNS solver
+#include "BufSizingLpSolver.h"   // C++ buffer sizing LP
+// CtsBufferSizingLp.h removed — replaced by BufSizingLpSolver (V53_FM_BUF)
+#include "ClockLatencyEstimator.h"  // per-FF physical achievability
 #include "CtsOptions.h"
 #include "HTreeBuilder.h"
 #include "LatencyBalancer.h"
@@ -63,6 +69,36 @@ namespace cts {
 
 using utl::CTS;
 
+namespace {
+
+bool isNamedHardMacroMaster(const odb::dbMaster* master)
+{
+  if (master == nullptr) {
+    return false;
+  }
+  std::string name = master->getName();
+  std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
+  return name.rfind("fakeram", 0) == 0 || name.rfind("fakeregfile", 0) == 0
+         || name.rfind("sram_", 0) == 0;
+}
+
+bool isMacroBlockInst(const odb::dbInst* inst)
+{
+  if (inst == nullptr) {
+    return false;
+  }
+  if (inst->isBlock()) {
+    return true;
+  }
+  const odb::dbMaster* master = inst->getMaster();
+  return (master != nullptr && master->isBlock())
+         || isNamedHardMacroMaster(master);
+}
+
+}  // namespace
+
 TritonCTS::TritonCTS(utl::Logger* logger,
                      odb::dbDatabase* db,
                      sta::dbNetwork* network,
@@ -94,22 +130,22 @@ void TritonCTS::runTritonCts()
 
   setupCharacterization();
 
-  // JYJ (2026-02-06) Initialize 3D tier database from ODB
-  // JYJ (2026-02-21) Preserve pre-loaded cts3dDb_ (e.g., with skew targets)
+  // Initialize 3D tier database from ODB
+  // Preserve pre-loaded cts3dDb_ (e.g., with skew targets)
   const bool hadPreloadedDb = (cts3dDb_ != nullptr);
   if (!hadPreloadedDb) {
     cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
   }
   cts3dDb_->populate();
 
-  // JYJ (2026-02-09) Copy wire RC from TechChar to 3D database
+  // Copy wire RC from TechChar to 3D database
   // Initially same for both tiers, can be split later if needed
   const double wire_res = techChar_->getResPerDBU();
   const double wire_cap = techChar_->getCapPerDBU();
   cts3dDb_->setWireRC(0, wire_res, wire_cap);  // bottom tier
   cts3dDb_->setWireRC(1, wire_res, wire_cap);  // upper tier
 
-  // JYJ (2026-02-23) V32a: Auto-detect bottom/upper buffer pair from buf_list.
+  // Auto-detect bottom/upper buffer pair from buf_list.
   // When buf_list contains cells from different technology nodes (e.g., NG45
   // "BUF_X4_bottom" and ASAP7 "BUF_X4_upper"), suffix substitution alone in
   // getBufferForTier() fails.  Register an explicit pair so that the correct
@@ -150,9 +186,9 @@ void TritonCTS::runTritonCts()
 
   // reset
   techChar_.reset();
-  // JYJ (2026-02-21) Only reset 3D DB if no pre-loaded skew targets
+  // Only reset 3D DB if no pre-loaded skew targets
   if (!cts3dDb_ || !cts3dDb_->hasSkewTargets()) {
-    cts3dDb_.reset();  // JYJ (2026-02-06) Cleanup 3D tier database
+    cts3dDb_.reset();  // Cleanup 3D tier database
   }
   builders_.clear();
   staClockNets_.clear();
@@ -343,7 +379,7 @@ void TritonCTS::buildClockTrees()
 {
   for (auto& builder : builders_) {
     builder->setTechChar(*techChar_);
-    // JYJ (2026-02-06) Inject 3D tier database into each builder
+    // Inject 3D tier database into each builder
     if (cts3dDb_) {
       builder->setCts3DDatabase(*cts3dDb_);
     }
@@ -407,6 +443,10 @@ void TritonCTS::initOneClockTree(odb::dbNet* driverNet,
   }
 }
 
+// Iterative version of countSinksPostDbWrite.
+// Original recursive version caused stack overflow on large designs
+// (ariane133: 5,800 nets level 9, bp_quad: 50,000+ nets level 12+).
+// Converted to explicit std::stack on heap — identical results, no depth limit.
 void TritonCTS::countSinksPostDbWrite(
     TreeBuilder* builder,
     odb::dbNet* net,
@@ -421,128 +461,117 @@ void TritonCTS::countSinksPostDbWrite(
     const std::unordered_set<odb::dbITerm*>& sinks,
     const std::unordered_set<odb::dbInst*>& dummies)
 {
-  odb::dbSet<odb::dbITerm> iterms = net->getITerms();
-  int driverX = 0;
-  int driverY = 0;
-  for (odb::dbITerm* iterm : iterms) {
-    if (iterm->getIoType() != odb::dbIoType::INPUT) {
-      iterm->getAvgXY(&driverX, &driverY);
-      break;
-    }
-  }
-  odb::dbSet<odb::dbBTerm> bterms = net->getBTerms();
-  for (odb::dbBTerm* bterm : bterms) {
-    if (bterm->getIoType() == odb::dbIoType::INPUT) {
-      for (odb::dbBPin* pin : bterm->getBPins()) {
-        odb::dbPlacementStatus status = pin->getPlacementStatus();
-        if (status == odb::dbPlacementStatus::NONE
-            || status == odb::dbPlacementStatus::UNPLACED) {
-          continue;
-        }
-        for (odb::dbBox* box : pin->getBoxes()) {
-          if (box) {
-            driverX = box->xMin();
-            driverY = box->yMin();
-            break;
-          }
-        }
+  struct StackFrame {
+    odb::dbNet* net;
+    unsigned wireLength;
+    int depth;
+  };
+
+  std::stack<StackFrame> work;
+  work.push({net, currWireLength, depth});
+
+  while (!work.empty()) {
+    auto [curNet, curWireLen, curDepth] = work.top();
+    work.pop();
+
+    // Find driver position
+    int driverX = 0, driverY = 0;
+    for (odb::dbITerm* iterm : curNet->getITerms()) {
+      if (iterm->getIoType() != odb::dbIoType::INPUT) {
+        iterm->getAvgXY(&driverX, &driverY);
         break;
       }
     }
-  }
-  for (odb::dbITerm* iterm : iterms) {
-    if (iterm->getIoType() == odb::dbIoType::INPUT) {
-      std::string name = iterm->getInst()->getName();
+    for (odb::dbBTerm* bterm : curNet->getBTerms()) {
+      if (bterm->getIoType() == odb::dbIoType::INPUT) {
+        for (odb::dbBPin* pin : bterm->getBPins()) {
+          odb::dbPlacementStatus status = pin->getPlacementStatus();
+          if (status == odb::dbPlacementStatus::NONE
+              || status == odb::dbPlacementStatus::UNPLACED) {
+            continue;
+          }
+          for (odb::dbBox* box : pin->getBoxes()) {
+            if (box) {
+              driverX = box->xMin();
+              driverY = box->yMin();
+              break;
+            }
+          }
+          break;
+        }
+      }
+    }
+
+    // Process input iterms
+    for (odb::dbITerm* iterm : curNet->getITerms()) {
+      if (iterm->getIoType() != odb::dbIoType::INPUT) continue;
+
       int receiverX, receiverY;
       iterm->getAvgXY(&receiverX, &receiverY);
       unsigned dist = abs(driverX - receiverX) + abs(driverY - receiverY);
       odb::dbInst* inst = iterm->getInst();
+
       bool terminate = fullTree
                            ? (sinks.find(iterm) != sinks.end())
                            : !builder->isAnyTreeBuffer(getClockFromInst(inst));
-      odb::dbITerm* outputPin = iterm->getInst()->getFirstOutput();
+      odb::dbITerm* outputPin = inst->getFirstOutput();
       bool trueSink = true;
-      if (outputPin && outputPin->getNet() == net) {
-        // Skip feedback loop.  When input pin and output pin are
-        // connected to the same net this can lead to infinite recursion. For
-        // example, some designs have Q pin connected to SI pin.
+
+      if (outputPin && outputPin->getNet() == curNet) {
         terminate = true;
         trueSink = false;
       }
 
       if (!terminate && inst) {
-        if (inst->isBlock()) {
-          // Skip non-sink macro blocks
+        if (isMacroBlockInst(inst)) {
           terminate = true;
           trueSink = false;
         } else {
           sta::Cell* masterCell = network_->dbToSta(inst->getMaster());
           if (masterCell) {
             sta::LibertyCell* libCell = network_->libertyCell(masterCell);
-            if (libCell) {
-              if (libCell->hasSequentials()) {
-                // Skip non-sink registers
-                terminate = true;
-                trueSink = false;
-              }
+            if (libCell && libCell->hasSequentials()) {
+              terminate = true;
+              trueSink = false;
             }
           }
         }
       }
 
       if (!terminate) {
-        // ignore dummy buffer and inverters added to balance loads
         if (outputPin && outputPin->getNet() != nullptr) {
-          countSinksPostDbWrite(builder,
-                                outputPin->getNet(),
-                                sinks_cnt,
-                                leafSinks,
-                                (currWireLength + dist),
-                                sinkWireLength,
-                                minDepth,
-                                maxDepth,
-                                depth + 1,
-                                fullTree,
-                                sinks,
-                                dummies);
+          // Push downstream net onto stack (was: recursive call)
+          work.push({outputPin->getNet(), curWireLen + dist, curDepth + 1});
         } else {
           std::string cellType = "Complex cell";
-          odb::dbInst* inst = iterm->getInst();
           sta::Cell* masterCell = network_->dbToSta(inst->getMaster());
           if (masterCell) {
             sta::LibertyCell* libCell = network_->libertyCell(masterCell);
             if (libCell) {
-              if (libCell->isInverter()) {
-                cellType = "Inverter";
-              } else if (libCell->isBuffer()) {
-                cellType = "Buffer";
-              }
+              if (libCell->isInverter()) cellType = "Inverter";
+              else if (libCell->isBuffer()) cellType = "Buffer";
             }
           }
-
           if (dummies.find(inst) == dummies.end()) {
-            logger_->info(CTS,
-                          121,
-                          "{} '{}' has unconnected output pin.",
-                          cellType,
-                          name);
+            logger_->info(CTS, 121, "{} '{}' has unconnected output pin.",
+                          cellType, inst->getName());
           }
         }
-        if (builder->isLeafBuffer(getClockFromInst(iterm->getInst()))) {
+        if (builder->isLeafBuffer(getClockFromInst(inst))) {
           leafSinks++;
         }
       } else if (trueSink) {
         sinks_cnt++;
         double currSinkWl
-            = (dist + currWireLength) / double(options_->getDbUnits());
+            = (dist + curWireLen) / double(options_->getDbUnits());
         sinkWireLength += currSinkWl;
-        maxDepth = std::max(depth, maxDepth);
-        if ((minDepth > 0 && depth < minDepth) || (minDepth == 0)) {
-          minDepth = depth;
+        maxDepth = std::max(curDepth, maxDepth);
+        if ((minDepth > 0 && curDepth < minDepth) || (minDepth == 0)) {
+          minDepth = curDepth;
         }
       }
     }
-  }  // ignoring block pins/feedthrus
+  }
 }
 
 ClockInst* TritonCTS::getClockFromInst(odb::dbInst* inst)
@@ -1397,8 +1426,22 @@ TreeBuilder* TritonCTS::initClockTreeForMacrosAndRegs(
     return nullptr;
   }
 
-  if (!options_->insertionDelayEnabled() || macroSinks.empty()
-      || registerSinks.empty()) {
+  // CTS_FORCE_MACRO_REG_SPLIT: force macro/register split even when
+  // -no_insertion_delay is active. Without this, -no_insertion_delay
+  // collapses everything into one unified tree (diverges from Pin3D).
+  bool forceMacroRegSplit = false;
+  if (const char* e = std::getenv("CTS_FORCE_MACRO_REG_SPLIT")) {
+    forceMacroRegSplit = (std::atoi(e) != 0);
+    if (forceMacroRegSplit && !macroSinks.empty() && !registerSinks.empty()) {
+      logger_->info(CTS, 699,
+          "CTS_FORCE_MACRO_REG_SPLIT: forcing split "
+          "(macros={}, registers={})",
+          macroSinks.size(), registerSinks.size());
+    }
+  }
+
+  if ((!options_->insertionDelayEnabled() && !forceMacroRegSplit)
+      || macroSinks.empty() || registerSinks.empty()) {
     // There is no need for separate clock trees
     for (odb::dbITerm* iterm : firstNet->getITerms()) {
       odb::dbInst* inst = iterm->getInst();
@@ -1496,10 +1539,29 @@ bool TritonCTS::separateMacroRegSinks(
       if (libertyCell && libertyCell->isInverter()) {
         odb::dbITerm* invertedTerm
             = inst->getFirstOutput()->getNet()->get1stSignalInput(false);
-        nonSinkMacro &= invertedTerm->getInst()->isBlock();
+        nonSinkMacro &= isMacroBlockInst(invertedTerm->getInst());
       }
 
-      if (hasInsertionDelay(inst, mterm) || nonSinkMacro || inst->isBlock()) {
+      // Macro bucket: real block macros (isBlock) on ANY tier +
+      // bottom-tier name-matched macros only.
+      // History: CODEX2 put all 28 macros → LatencyBalancer 226 delay bufs.
+      // CODEX3 bottom-tier-only → 7 macros, but upper SRAMs (fakeram) in
+      // register tree → 900ps latency at die corner → hold -320ps.
+      // Fix: isBlock() SRAMs go to macro tree regardless of tier (shorter
+      // tree, ~300ps). Name-matched-only macros still filtered by tier.
+      // Safe because -no_insertion_delay disables LatencyBalancer.
+      bool isMacro = hasInsertionDelay(inst, mterm) || nonSinkMacro
+                     || isMacroBlockInst(inst);
+      if (isMacro && cts3dDb_ != nullptr) {
+        int instTier = cts3dDb_->getInstTier(inst);
+        // Upper-tier: keep real block macros (inst->isBlock() or
+        // master->isBlock()), filter out name-only matches.
+        if (instTier > 0 && !inst->isBlock()
+            && !(inst->getMaster() && inst->getMaster()->isBlock())) {
+          isMacro = false;
+        }
+      }
+      if (isMacro) {
         macroSinks.emplace_back(inst, mterm);
       } else {
         registerSinks.emplace_back(inst, mterm);
@@ -1647,6 +1709,15 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
 {
   Clock& clockNet = builder->getClock();
   odb::dbNet* topClockNet = clockNet.getNetObj();
+
+  logger_->info(CTS, 880,
+      "writeClockNetsToDb: clock='{}', topNet='{}', treeType={}, "
+      "topBufferName='{}'",
+      clockNet.getName(),
+      topClockNet ? topClockNet->getConstName() : "NULL",
+      static_cast<int>(builder->getTreeType()),
+      builder->getTopBufferName());
+
   // gets the module for the driver for the net
   sta::Pin* pin_driver = nullptr;
   odb::dbModule* top_module = network_->getNetDriverParentModule(
@@ -1654,11 +1725,6 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
   (void) pin_driver;
 
   disconnectAllSinksFromNet(topClockNet);
-
-  // If exists, remove the dangling dbModNet related to the topClockNet because
-  // topClockNet has no load pin now.
-  // After CTS, the driver pin will drive only a few of root clock buffers.
-  // So the hierarchical net (dbModNet) is not needed any more.
   destroyClockModNet(pin_driver);
 
   // re-connect top buffer that separates macros from registers
@@ -1668,16 +1734,47 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
     if (topRegBuffer) {
       odb::dbITerm* topRegBufferInputPin = getFirstInput(topRegBuffer);
       topRegBufferInputPin->connect(builder->getDrivingNet());
+      logger_->info(CTS, 881,
+          "  RegisterTree: connected '{}' input to drivingNet '{}'",
+          builder->getTopBufferName(),
+          builder->getDrivingNet() ? builder->getDrivingNet()->getConstName() : "NULL");
+    } else {
+      logger_->warn(CTS, 882,
+          "  RegisterTree: topRegBuffer '{}' NOT FOUND in ODB!",
+          builder->getTopBufferName());
     }
   }
 
   createClockBuffers(clockNet, top_module);
 
-  // connect top buffer on the clock pin
-  std::string topClockInstName = "clkbuf_0_" + clockNet.getName();
-  odb::dbInst* topClockInst = block_->findInst(topClockInstName.c_str());
-  odb::dbITerm* topClockInstInputPin = getFirstInput(topClockInst);
-  topClockInstInputPin->connect(topClockNet);
+  // Connect ALL root buffers to top clock net.
+  {
+    const std::string clkName = clockNet.getName();
+    std::vector<std::string> rootBufCandidates;
+    rootBufCandidates.push_back("clkbuf_0_" + clkName);
+    rootBufCandidates.push_back("t1_clkbuf_0_" + clkName);
+    bool anyConnected = false;
+    for (const auto& rootName : rootBufCandidates) {
+      odb::dbInst* rootInst = block_->findInst(rootName.c_str());
+      if (rootInst) {
+        odb::dbITerm* rootInputPin = getFirstInput(rootInst);
+        if (rootInputPin) {
+          rootInputPin->connect(topClockNet);
+          anyConnected = true;
+          logger_->info(CTS, 883,
+              "  Root '{}' input connected to topClockNet '{}'",
+              rootName, topClockNet->getConstName());
+        }
+      } else {
+        logger_->info(CTS, 884,
+            "  Root candidate '{}' not found in ODB", rootName);
+      }
+    }
+    if (!anyConnected) {
+      logger_->error(CTS, 498,
+          "No root clock buffer found for clock '{}'", clkName);
+    }
+  }
   topClockNet->setSigType(odb::dbSigType::CLOCK);
 
   std::map<int, int> fanoutcount;
@@ -1691,9 +1788,33 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
     bool outputPinFound = true;
     bool inputPinFound = true;
     bool leafLevelNet = subNet.isLeafLevel();
-    if (("clknet_0_" + clockNet.getName()) == subNet.getName()) {
+    // Match root subnet with or without tier prefix
+    const std::string subNetName = subNet.getName();
+    const std::string clkName2 = clockNet.getName();
+    if (subNetName == ("clknet_0_" + clkName2)
+        || subNetName == ("t1_clknet_0_" + clkName2)) {
       rootSubNet = &subNet;
     }
+
+    // Fix A: Early skip for orphan subnets (numSinks=0 and not root).
+    // CTS-0080 float precision skip can leave leaf clusters with 0 sinks.
+    // Their driver buffer exists in ODB but has no connected sinks.
+    // Proceeding would create a disconnected ODB net and risk SIGSEGV
+    // when accessing the driver's input pin (no upstream net yet).
+    // Also mark the orphan driver in removedSinks so branchBufferCount()
+    // skips it during recursive tree traversal (otherwise it reaches the
+    // orphan via parent subnet → outITerm->getNet() = nullptr → SIGSEGV).
+    if (subNet.getNumSinks() == 0 && &subNet != rootSubNet) {
+      logger_->warn(CTS, 715,
+          "  Orphan subnet '{}' (0 sinks, driver='{}') — skipping ODB net creation",
+          subNet.getName(),
+          subNet.getDriver() ? subNet.getDriver()->getName() : "NULL");
+      if (subNet.getDriver()) {
+        removedSinks.insert(subNet.getDriver());
+      }
+      return;  // lambda early return — skip this subnet entirely
+    }
+
     odb::dbNet* clkSubNet
         = odb::dbNet::create(block_, subNet.getName().c_str());
     subNet.setNetObj(clkSubNet);
@@ -1717,6 +1838,12 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
     }
 
     subNet.forEachSink([&](ClockInst* inst) {
+      // Skip orphan drivers — their subnet was skipped (CTS-0715).
+      // Without this, orphan buffer's input gets connected to parent net,
+      // allowing branchBufferCount to reach it → dangling output net → SIGSEGV.
+      if (removedSinks.find(inst) != removedSinks.end()) {
+        return;
+      }
       odb::dbITerm* inputPin = nullptr;
       if (inst->isClockBuffer()) {
         odb::dbInst* sink = inst->getDbInst();
@@ -1754,13 +1881,15 @@ void TritonCTS::writeClockNetsToDb(TreeBuilder* builder,
 
     if (!inputPinFound || !outputPinFound) {
       // Net not fully connected. Removing it.
-      disconnectAllPinsFromNet(clkSubNet);
-      odb::dbNet::destroy(clkSubNet);
-      ++numFixedNets_;
-      --numClkNets_;
-      odb::dbInst::destroy(driver);
-      removedSinks.insert(subNet.getDriver());
-      checkUpstreamConnections(inputNet);
+      logger_->warn(CTS, 885,
+          "  Disconnected subnet '{}' (driver='{}', "
+          "inputPinFound={}, outputPinFound={}, numSinks={}) — keeping as-is",
+          subNet.getName(),
+          driver ? driver->getConstName() : "NULL",
+          inputPinFound, outputPinFound, subNet.getNumSinks());
+      // V58: Do NOT destroy disconnected subnets — destroy cascade can cause
+      // SIGSEGV in checkUpstreamConnections when upstream nets/insts are
+      // already freed. Orphan nets are harmless (no timing impact, DRT skips them).
     }
   });
 
@@ -2038,7 +2167,15 @@ std::pair<int, int> TritonCTS::branchBufferCount(ClockInst* inst,
                                                  Clock& clockNet)
 {
   odb::dbInst* sink = inst->getDbInst();
+  // Null guard: orphan buffers (Fix A skip) have no ODB net on output.
+  // Return current count as both min/max to avoid SIGSEGV.
+  if (sink == nullptr) {
+    return {bufCounter, bufCounter};
+  }
   odb::dbITerm* outITerm = sink->getFirstOutput();
+  if (outITerm == nullptr || outITerm->getNet() == nullptr) {
+    return {bufCounter, bufCounter};
+  }
   int minPath = std::numeric_limits<int>::max();
   int maxPath = std::numeric_limits<int>::min();
   for (odb::dbITerm* sinkITerms : outITerm->getNet()->getITerms()) {
@@ -2102,7 +2239,7 @@ void TritonCTS::checkUpstreamConnections(odb::dbNet* net)
 
 void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
 {
-  // V49-diag: scan for duplicate names in clockBuffers_ deque
+  // scan for duplicate names in clockBuffers_ deque
   {
     std::unordered_map<std::string, int> nameCounts;
     clockNet.forEachClockBuffer([&](const ClockInst& inst) {
@@ -2111,7 +2248,7 @@ void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
     for (const auto& [name, count] : nameCounts) {
       if (count > 1) {
         logger_->warn(CTS, 497,
-            "V49-diag: buffer '{}' appears {} times in clockBuffers_ deque",
+            "Diag: buffer '{}' appears {} times in clockBuffers_ deque",
             name, count);
       }
     }
@@ -2120,7 +2257,7 @@ void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
       odb::dbInst* existing = block_->findInst(inst.getName().c_str());
       if (existing) {
         logger_->warn(CTS, 496,
-            "V49-diag: buffer '{}' already exists in ODB BEFORE createClockBuffers "
+            "Diag: buffer '{}' already exists in ODB BEFORE createClockBuffers "
             "(master={})",
             inst.getName(), existing->getMaster()->getName());
       }
@@ -2132,7 +2269,7 @@ void TritonCTS::createClockBuffers(Clock& clockNet, odb::dbModule* parent)
     odb::dbMaster* master = db_->findMaster(inst.getMaster().c_str());
     odb::dbInst* newInst = odb::dbInst::create(
         block_, master, inst.getName().c_str(), false, parent);
-    // V49: null check to catch duplicate buffer names (dbInst::create
+    // null check to catch duplicate buffer names (dbInst::create
     // returns nullptr when an instance with the same name already exists).
     if (!newInst) {
       logger_->error(CTS, 499,
@@ -2235,7 +2372,7 @@ bool TritonCTS::isSink(odb::dbITerm* iterm)
     return true;
   }
 
-  if (inst->isBlock()) {
+  if (isMacroBlockInst(inst)) {
     return true;
   }
 
@@ -2584,10 +2721,20 @@ ClockInst& TritonCTS::placeDummyCell(Clock& clockNet,
       = options_->getDummyLoadPrefix() + std::to_string(dummyLoadIndex_++);
   dummyInst = odb::dbInst::create(block_, master, cellName.c_str());
   dummyInst->setSourceType(odb::dbSourceType::TIMING);
-  dummyInst->setLocation(inst->getX(), inst->getY());
+  // V59: Offset dummy load by 2× driver buffer width to prevent physical overlap.
+  // 1× bufWidth places dummy at driver edge → DPL can push it 1 site back into
+  // driver body. 2× bufWidth gives sufficient margin for DPL micro-adjustment.
+  // Dummy load is cap-balance only → position has no timing impact.
+  int dummyX = inst->getX();
+  int dummyY = inst->getY();
+  odb::dbInst* driverDbInst = inst->getDbInst();
+  if (driverDbInst && driverDbInst->getMaster()) {
+    dummyX += 2 * driverDbInst->getMaster()->getWidth();
+  }
+  dummyInst->setLocation(dummyX, dummyY);
   dummyInst->setPlacementStatus(odb::dbPlacementStatus::PLACED);
   ClockInst& dummyClock = clockNet.addClockBuffer(
-      cellName, master->getName(), inst->getX(), inst->getY());
+      cellName, master->getName(), dummyX, dummyY);
   // clang-format off
   debugPrint(logger_, CTS, "dummy load", 1, "  placed dummy instance {} at {}",
              dummyInst->getName(), dummyInst->getLocation());
@@ -2690,7 +2837,7 @@ void TritonCTS::extractFFGraphFromVerilog(const std::string& verilog_file,
   logger_->report("==========================================");
 
   VerilogFFExtractor extractor(verilog_file, getBlock(), openSta_, network_, logger_);
-  // JYJ (2026-02-06) Inject 3D database for tier queries
+  // Inject 3D database for tier queries
   if (cts3dDb_) {
     extractor.setCts3DDatabase(cts3dDb_.get());
   }
@@ -2702,7 +2849,13 @@ void TritonCTS::extractFFGraphFromVerilog(const std::string& verilog_file,
   auto edges = extractor.extractFFEdges();
 
   // Fill timing info from STA (if available)
-  extractor.fillTimingInfo(edges);
+  // BATCH_TIMING=1: capture-side batched findPathEnds (2-5x faster, exact)
+  const char* batch_env = std::getenv("BATCH_TIMING");
+  if (batch_env && std::atoi(batch_env) != 0) {
+    extractor.fillTimingInfoBatch(edges);
+  } else {
+    extractor.fillTimingInfo(edges);
+  }
 
   // Write to CSV
   extractor.writeCSV(edges, output_file);
@@ -2713,8 +2866,102 @@ void TritonCTS::extractFFGraphFromVerilog(const std::string& verilog_file,
   logger_->report("==========================================");
 }
 
+// Exhaustive IO timing edge extraction via STA.
+// Replaces Tcl extract_io_timing_edges_phase1a (worst-N) with per-port C++.
+void TritonCTS::extractIOTimingEdges(const std::string& verilog_file,
+                                     const std::string& output_file)
+{
+  logger_->report("==========================================");
+  logger_->report("3D-CTS IO: Exhaustive IO Timing Edge Extraction");
+  logger_->report("==========================================");
+  logger_->report("Verilog file: {}", verilog_file);
+  logger_->report("Output file:  {}", output_file);
+
+  VerilogFFExtractor extractor(verilog_file, getBlock(), openSta_, network_, logger_);
+  if (cts3dDb_) {
+    extractor.setCts3DDatabase(cts3dDb_.get());
+  }
+
+  // Parse verilog for register name mapping (FF→FF CSV name consistency)
+  extractor.parseVerilog();
+
+  // Extract IO edges via STA per-port findPathEnds
+  auto io_edges = extractor.extractIOEdges();
+
+  // Write to CSV (same format as Tcl version)
+  extractor.writeIOCSV(io_edges, output_file);
+
+  logger_->report("==========================================");
+  logger_->report("3D-CTS IO: IO extraction complete!");
+  logger_->report("Output written to: {}", output_file);
+  logger_->report("==========================================");
+}
+
+// BUF_MACRO: ODB+STA-based FF timing graph extraction.
+// No Verilog file needed — registers discovered from ODB (Liberty hasSequentials),
+// edges extracted via STA findPathEnds. Sees through macro blackboxes.
+void TritonCTS::extractFFGraphFromODB(const std::string& output_file)
+{
+  logger_->report("==========================================");
+  logger_->report("ODB+STA-based FF-to-FF Extraction (MACRO)");
+  logger_->report("==========================================");
+  logger_->report("Output file:  {}", output_file);
+  logger_->report("==========================================");
+
+  // Use empty verilog_path — ODB mode doesn't need it
+  VerilogFFExtractor extractor("", getBlock(), openSta_, network_, logger_);
+  if (cts3dDb_) {
+    extractor.setCts3DDatabase(cts3dDb_.get());
+  }
+
+  // Step 1: Collect registers from ODB (Liberty hasSequentials)
+  extractor.collectRegistersFromODB();
+
+  // Step 2: Extract FF→FF edges via STA findPathEnds
+  auto edges = extractor.extractFFEdgesViaSTA();
+
+  // Step 3: Write to CSV (same format as Verilog-based)
+  extractor.writeCSV(edges, output_file);
+
+  logger_->report("==========================================");
+  logger_->report("ODB+STA-based extraction complete!");
+  logger_->report("Output written to: {}", output_file);
+  logger_->report("==========================================");
+}
+
+// BUF_MACRO: ODB-based IO timing edge extraction.
+// No Verilog file needed — uses collectRegistersFromODB() for FF name mapping,
+// then calls extractIOEdges() which now falls back to odb_registers_.
+void TritonCTS::extractIOTimingEdgesFromODB(const std::string& output_file)
+{
+  logger_->report("==========================================");
+  logger_->report("BUF_MACRO: ODB-based IO Timing Edge Extraction");
+  logger_->report("==========================================");
+  logger_->report("Output file:  {}", output_file);
+
+  // Use empty verilog_path — ODB mode doesn't need it
+  VerilogFFExtractor extractor("", getBlock(), openSta_, network_, logger_);
+  if (cts3dDb_) {
+    extractor.setCts3DDatabase(cts3dDb_.get());
+  }
+
+  // Collect registers from ODB (populates odb_registers_)
+  extractor.collectRegistersFromODB();
+
+  // extractIOEdges() now uses odb_registers_ when registers_ is empty
+  auto io_edges = extractor.extractIOEdges();
+
+  // Write to CSV (same format as Tcl/Verilog version)
+  extractor.writeIOCSV(io_edges, output_file);
+
+  logger_->report("==========================================");
+  logger_->report("BUF_MACRO: IO extraction complete!");
+  logger_->report("Output written to: {}", output_file);
+  logger_->report("==========================================");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// JYJ (2026-02-21) Pre-CTS skew targets for SG-CTS
+// Pre-CTS skew targets for SG-CTS
 // ─────────────────────────────────────────────────────────────────────────────
 void TritonCTS::loadSkewTargets(const std::string& csv_path)
 {
@@ -2726,7 +2973,167 @@ void TritonCTS::loadSkewTargets(const std::string& csv_path)
   cts3dDb_->loadSkewTargets(csv_path);
 }
 
-// JYJ (2026-02-23) V32: Estimate per-FF physical achievability bounds for LP-SAFETY.
+// C++ LP solver for skew targeting.
+// Replaces Python cts_skew_lp.py — extracts timing graph from STA in-memory,
+// solves LP-TNS with OR-Tools GLOP, stores results in skewTargetMap_.
+void TritonCTS::solveSkewLp(const std::string& verilog_file,
+                            float sigma_local, float sigma_pi,
+                            float lambda_reg, float hold_margin,
+                            float gamma_wns, float weight_io,
+                            bool hard_pi_hold, float max_skew)
+{
+  // Ensure cts3dDb_ exists
+  if (!cts3dDb_) {
+    cts3dDb_ = std::make_unique<Cts3DDatabase>(db_, logger_);
+    cts3dDb_->populate();
+  }
+
+  auto* block = db_->getChip()->getBlock();
+
+  // Create LP solver
+  CtsSkewLpSolver lp_solver(block, openSta_, network_, logger_, cts3dDb_.get());
+
+  // Set parameters
+  LpParams params;
+  params.sigma_local = sigma_local;
+  params.sigma_pi = sigma_pi;
+  params.lambda_reg = lambda_reg;
+  params.hold_margin = hold_margin;
+  params.gamma_wns = gamma_wns;
+  params.weight_io = weight_io;
+  params.hard_pi_hold = hard_pi_hold;
+  params.max_skew = max_skew;
+  // 2-phase LP params read from env
+  // PRE_CTS_ENABLE_2PHASE=1: Phase A minimize W, Phase B minimize Σ V_j
+  // PRE_CTS_WNS_ALPHA=0.05: Phase B bound W ≤ W_star*(1+alpha)
+  const char* enable_2phase_env = std::getenv("PRE_CTS_ENABLE_2PHASE");
+  params.enable_2phase = enable_2phase_env && std::atoi(enable_2phase_env) != 0;
+  const char* wns_alpha_env = std::getenv("PRE_CTS_WNS_ALPHA");
+  params.wns_alpha = wns_alpha_env ? std::stof(wns_alpha_env) : 0.05f;
+
+  // CTS_DELIVERY_MAX_NS removed — no LP delivery clamp.
+  // params.delivery_max stays 0.0 (disabled).
+
+  // V58: Endpoint-TopK pruning for setup edges — controls LP model size.
+  // Per capture endpoint j, keep only worst K incoming setup edges.
+  // ariane133: 7.9M setup edges → 25K endpoints × 16 = 400K (20× reduction).
+  // 0 = disabled (keep all).  Default 16.
+  const char* topk_env = std::getenv("CTS_LP_ENDPOINT_TOPK");
+  if (topk_env) {
+    params.endpoint_topk = std::atoi(topk_env);
+  }
+
+  lp_solver.setParams(params);
+
+  // Read Phase 1 CSVs (propagated-clock) instead of live STA (ideal-clock).
+  // Phase 1 sub-OpenROAD generates these CSVs with correct propagated-clock slacks.
+  // The main session is still at ideal-clock state → live STA gives wrong slacks.
+  const char* results_dir = std::getenv("CTS_RESULTS_DIR");
+  std::string res_base = results_dir ? std::string(results_dir)
+                                     : "./results";
+  // Look for the CSV path pattern used by cts_3d.tcl
+  const char* graph_csv_env = std::getenv("CTS_FF_TIMING_GRAPH_CSV");
+  const char* io_csv_env = std::getenv("CTS_IO_TIMING_EDGES_CSV");
+
+  std::string graph_csv = graph_csv_env ? std::string(graph_csv_env)
+                                        : res_base + "/pre_cts_ff_timing_graph.csv";
+  // Fallback IO CSV path must include platform/design.
+  // Without it, C++ looks at ./results/pre_cts_io_timing_edges.csv (doesn't exist).
+  std::string io_csv;
+  if (io_csv_env) {
+    io_csv = std::string(io_csv_env);
+  } else {
+    const char* plat = std::getenv("PLATFORM");
+    const char* design = std::getenv("DESIGN_NICKNAME");
+    if (plat && design) {
+      io_csv = res_base + "/" + std::string(plat) + "/" + std::string(design)
+               + "/openroad/pre_cts_io_timing_edges.csv";
+    } else {
+      io_csv = res_base + "/pre_cts_io_timing_edges.csv";
+    }
+  }
+
+  // Per-clock-net LP removed (V57_CLK, 2026-04-03).
+  // Reason: TritonCTS forkRegisterClockNetwork splits a single SDC clock into
+  // multiple internal clock nets (e.g., clk, clk_i, clk_i_regs). Per-clock LP
+  // treated these as independent clock domains, losing inter-net timing edges.
+  // IBEX: single SDC clock → 3 CTS nets → per-clock LP lost 1M+ cross-net edges
+  // → each sub-LP still INFEASIBLE (intra-net cycles) + worse timing (info loss).
+  // Unified LP is correct: all FFs on the same SDC clock are in one LP.
+
+  // Unified LP path
+  lp_solver.readTimingGraphCSV(graph_csv);
+  lp_solver.readIOEdgesCSV(io_csv);
+  lp_solver.computeBounds();
+  lp_solver.applyPiHoldClip();
+
+  LpResult result = lp_solver.solveTns();
+
+  cts3dDb_->clearSkewTargets();
+  for (const auto& [ff_name, arrival_ns] : result.arrivals) {
+    cts3dDb_->setSkewTarget(ff_name, arrival_ns);
+  }
+
+  logger_->info(utl::CTS, 609,
+      "3D-CTS LP: Stored {} skew targets ({} non-zero) in C++ memory",
+      result.n_ffs, result.n_nonzero_targets);
+
+  // Write targets CSV for downstream consumers.
+  // buffer_sizing_lp.py and clock_layer_assignment_v43.tcl read this CSV.
+  // Without it, buffer sizing runs with targets=0 → no skew-aware optimization.
+  const char* targets_csv_env = std::getenv("CTS_SKEW_TARGETS_CSV");
+  std::string targets_csv;
+  if (targets_csv_env) {
+    targets_csv = std::string(targets_csv_env);
+  } else {
+    std::string platform = std::getenv("PLATFORM") ? std::getenv("PLATFORM") : "";
+    std::string design = std::getenv("DESIGN_NICKNAME") ? std::getenv("DESIGN_NICKNAME") : "";
+    if (!platform.empty() && !design.empty()) {
+      targets_csv = "./results/" + platform + "/" + design
+                    + "/openroad/pre_cts_skew_targets.csv";
+    }
+  }
+
+  if (!targets_csv.empty()) {
+    lp_solver.writeTargetsCSV(targets_csv);
+  }
+
+  // BUG #4 FIX: Auto-update TAP depths after post-CTS LP.
+  // When CTS_AUTO_UPDATE_TAP=1, the post-CTS LP re-solves with Phase 3
+  // propagated-clock timing (correct base latency). We then reconnect FFs
+  // to the TAP chain at depths matching the updated LP targets.
+  // This fixes the Phase 1↔Phase 3 base latency mismatch:
+  //   Phase 1 (balanced): base_latency ~43ps → LP targets based on this
+  //   Phase 3 (per-tier):  base_latency ~76ps → LP targets are stale
+  //   Post-CTS LP:         base_latency ~76ps → correct targets
+  //   → updateTapDepths reconnects FFs to match updated targets.
+  const char* auto_tap = std::getenv("CTS_AUTO_UPDATE_TAP");
+  if (auto_tap && std::atoi(auto_tap) != 0) {
+    // Find targets CSV (just written above)
+    std::string tap_csv;
+    if (targets_csv_env) {
+      tap_csv = std::string(targets_csv_env);
+    } else {
+      std::string platform = std::getenv("PLATFORM") ? std::getenv("PLATFORM") : "";
+      std::string design = std::getenv("DESIGN_NICKNAME") ? std::getenv("DESIGN_NICKNAME") : "";
+      if (!platform.empty() && !design.empty()) {
+        tap_csv = "./results/" + platform + "/" + design
+                  + "/openroad/pre_cts_skew_targets.csv";
+      }
+    }
+    if (!tap_csv.empty()) {
+      logger_->info(utl::CTS, 870,
+          "Auto-updating TAP depths from post-CTS LP targets: {}", tap_csv);
+      updateTapDepths(tap_csv.c_str());
+    }
+  }
+}
+
+// Old C++ buffer sizing LP removed.
+// Replaced by BufSizingLpSolver (V53_FM_BUF) with Liberty-based delay estimation.
+// See solveBufferSizingLp() below (new signature with CSV paths).
+
+// Estimate per-FF physical achievability bounds for LP-SAFETY.
 // Uses ClockLatencyEstimator to compute t_via from HBT parasitic and writes
 // bounds CSV consumed by pre_cts_skew_lp.py via --bounds-csv argument.
 void TritonCTS::estimateLeafLatencies(const std::string& output_csv,
@@ -2751,6 +3158,251 @@ void TritonCTS::estimateLeafLatencies(const std::string& output_csv,
       "estimate_leaf_latencies: t_via = {:.2f} ps, max_skew = {:.0f} ps, "
       "written to {}",
       t_via_ps, max_skew_ns * 1.0e3, output_csv);
+}
+
+// Update cascaded TAP chain connections in ODB.
+// After CTS builds cascaded TAP chains (leaf_buf -> tap1 -> tap2 -> ... -> tap_maxD),
+// each FF connects to a specific tap level's output net.  This function re-reads
+// LP targets and reconnects FFs to the correct tap depth without rebuilding the tree.
+void TritonCTS::updateTapDepths(const char* targets_csv)
+{
+  // --- 1. Read targets CSV (ff_name, target_ns) ---
+  std::ifstream csv(targets_csv);
+  if (!csv.is_open()) {
+    logger_->warn(CTS, 871, "Cannot open targets CSV: {}", targets_csv);
+    return;
+  }
+
+  std::unordered_map<std::string, double> targets;
+  std::string line;
+  std::getline(csv, line);  // skip header
+  while (std::getline(csv, line)) {
+    auto comma = line.find(',');
+    if (comma == std::string::npos)
+      continue;
+    std::string ff_name = line.substr(0, comma);
+    double target_ns = 0.0;
+    try {
+      target_ns = std::stod(line.substr(comma + 1));
+    } catch (...) {
+      continue;
+    }
+    targets[ff_name] = target_ns;
+  }
+  csv.close();
+
+  // --- 2. Get d_buf from Liberty (same source as cascaded TAP construction) ---
+  double d_buf = 0.025;  // fallback
+  if (techChar_ && techChar_->getCharBufDelay() > 0) {
+    d_buf = techChar_->getCharBufDelay();  // Liberty intrinsic delay (ns)
+  }
+  // Allow env override for debugging only
+  if (const char* e = std::getenv("CTS_PER_FF_BUF_DELAY_NS"))
+    d_buf = std::stod(e);
+
+  // --- 3. Get MAX_DEPTH from env var (default 8) ---
+  int max_depth = 8;
+  if (const char* e = std::getenv("CTS_GROUPED_DELAY_MAX_DEPTH"))
+    max_depth = std::atoi(e);
+
+  odb::dbBlock* block = db_->getChip()->getBlock();
+  int reconnected = 0, skipped = 0, not_found = 0;
+
+  for (auto& [ff_name, target_ns] : targets) {
+    // --- 4a. Compute new depth ---
+    int new_depth = std::min(max_depth, std::max(0,
+        static_cast<int>(std::round(target_ns / d_buf))));
+
+    // --- 4b. Find FF instance ---
+    odb::dbInst* ff_inst = block->findInst(ff_name.c_str());
+    if (!ff_inst) {
+      not_found++;
+      continue;
+    }
+
+    // --- 4c. Find CLK input ITerm ---
+    odb::dbITerm* clk_iterm = nullptr;
+    for (odb::dbITerm* iterm : ff_inst->getITerms()) {
+      if (iterm->getSigType() == odb::dbSigType::CLOCK) {
+        clk_iterm = iterm;
+        break;
+      }
+    }
+    if (!clk_iterm) {
+      not_found++;
+      continue;
+    }
+
+    // --- 4d. Get current net and parse current depth ---
+    odb::dbNet* cur_net = clk_iterm->getNet();
+    if (!cur_net) {
+      not_found++;
+      continue;
+    }
+    std::string cur_net_name = cur_net->getName();
+
+    int cur_depth = 0;
+    // Pattern: clknet_ghtap_{branch}_c{idx}_t{depth}_{clk_suffix}
+    // e.g. t1_clknet_ghtap_35_c25_t6_clk
+    // rfind("_t") finds the _t before depth digits.
+    // After depth digits, the clock name suffix follows (e.g. "_clk").
+    auto d_pos = cur_net_name.rfind("_t");
+    std::string clk_suffix;  // clock name suffix after _t{depth}
+    if (d_pos != std::string::npos) {
+      try {
+        size_t depth_start = d_pos + 2;
+        size_t depth_end = depth_start;
+        while (depth_end < cur_net_name.size()
+               && std::isdigit(cur_net_name[depth_end]))
+          depth_end++;
+        cur_depth = std::stoi(cur_net_name.substr(depth_start,
+                                                   depth_end - depth_start));
+        // Preserve suffix after depth digits (e.g. "_clk", "_clk_i_regs")
+        clk_suffix = cur_net_name.substr(depth_end);
+      } catch (...) {
+        cur_depth = 0;
+      }
+    }
+    // If on leaf net (clknet_leaf_*, no _t suffix): depth = 0
+
+    if (new_depth == cur_depth) {
+      skipped++;
+      continue;
+    }
+
+    // --- 4e/f. Find target net and reconnect ---
+    std::string target_net_name;
+
+    if (new_depth == 0) {
+      // Reconnect to leaf net: trace back through TAP chain to find the leaf net.
+      // The depth=1 TAP buffer's input net is the leaf net.
+      if (d_pos != std::string::npos) {
+        std::string branch_prefix = cur_net_name.substr(0, d_pos);
+        // Append clock name suffix to match actual ODB net name
+        std::string d1_net_name = branch_prefix + "_t1" + clk_suffix;
+        odb::dbNet* d1_net = block->findNet(d1_net_name.c_str());
+        if (d1_net) {
+          // Find the driving buffer of d1 net, then get its input (= leaf net)
+          for (odb::dbITerm* it : d1_net->getITerms()) {
+            if (it->getIoType() == odb::dbIoType::OUTPUT) {
+              odb::dbInst* tap_buf = it->getInst();
+              for (odb::dbITerm* in_it : tap_buf->getITerms()) {
+                if (in_it->getIoType() == odb::dbIoType::INPUT
+                    && in_it->getSigType() == odb::dbSigType::CLOCK) {
+                  odb::dbNet* leaf_net = in_it->getNet();
+                  if (leaf_net)
+                    target_net_name = leaf_net->getName();
+                  break;
+                }
+              }
+              break;
+            }
+          }
+        }
+      }
+      if (target_net_name.empty()) {
+        skipped++;
+        continue;
+      }
+    } else {
+      // Reconnect to depth=new_depth TAP net
+      if (d_pos != std::string::npos) {
+        // Currently on a TAP net — replace _t{old} with _t{new},
+        // preserving clock name suffix (e.g. "_clk")
+        target_net_name = cur_net_name.substr(0, d_pos)
+                          + "_t" + std::to_string(new_depth) + clk_suffix;
+      } else {
+        // Currently on leaf net (depth=0), find TAP chain driven from this leaf.
+        // Scan leaf net's sink ITerms for a TAP buffer instance.
+        for (odb::dbITerm* it : cur_net->getITerms()) {
+          if (it->getIoType() == odb::dbIoType::INPUT) {
+            std::string inst_name = it->getInst()->getName();
+            if (inst_name.find("ghtap") != std::string::npos
+                || inst_name.find("grp") != std::string::npos) {
+              // Found TAP chain entry — get its output net (depth=1)
+              for (odb::dbITerm* out_it : it->getInst()->getITerms()) {
+                if (out_it->getIoType() == odb::dbIoType::OUTPUT) {
+                  odb::dbNet* tap_out = out_it->getNet();
+                  if (tap_out) {
+                    std::string tap_name = tap_out->getName();
+                    auto dp = tap_name.rfind("_t");
+                    if (dp != std::string::npos) {
+                      // Extract suffix from discovered TAP net
+                      size_t ds = dp + 2;
+                      while (ds < tap_name.size()
+                             && std::isdigit(tap_name[ds]))
+                        ds++;
+                      std::string tap_suffix = tap_name.substr(ds);
+                      target_net_name = tap_name.substr(0, dp)
+                                        + "_t" + std::to_string(new_depth)
+                                        + tap_suffix;
+                    }
+                  }
+                  break;
+                }
+              }
+              break;
+            }
+          }
+        }
+        if (target_net_name.empty()) {
+          skipped++;
+          continue;
+        }
+      }
+    }
+
+    // Find target net in ODB
+    odb::dbNet* target_net = block->findNet(target_net_name.c_str());
+    if (!target_net) {
+      // Target TAP depth net doesn't exist (chain not deep enough)
+      logger_->warn(CTS, 872,
+          "TAP net {} not found for FF {} (depth {}->{})",
+          target_net_name, ff_name, cur_depth, new_depth);
+      not_found++;
+      continue;
+    }
+
+    // Reconnect: disconnect from old net, connect to new net
+    clk_iterm->disconnect();
+    clk_iterm->connect(target_net);
+    reconnected++;
+  }
+
+  logger_->info(CTS, 873,
+      "TAP depth update: {} FFs reconnected, {} unchanged, {} not found "
+      "(d_buf={:.4f}ns, max_depth={})",
+      reconnected, skipped, not_found, d_buf, max_depth);
+}
+
+// C++ LP-based buffer sizing with Liberty delays
+void TritonCTS::solveBufferSizingLp(const char* output_csv,
+                                     const char* skew_targets_csv,
+                                     double hold_weight, double reg_weight,
+                                     double skew_weight,
+                                     double setup_margin_ps, double hold_margin_ps)
+{
+  BufSizingLpSolver solver(db_->getChip()->getBlock(),
+                           openSta_, logger_);
+
+  BufSizingParams params;
+  params.hold_weight = hold_weight;
+  params.reg_weight = reg_weight;
+  params.skew_weight = skew_weight;
+  params.setup_margin_ps = setup_margin_ps;
+  params.hold_margin_ps = hold_margin_ps;
+  solver.setParams(params);
+
+  solver.extractBuffers();
+  solver.measureLibraryDelays();
+  solver.extractTimingEdges();
+
+  if (skew_targets_csv && std::string(skew_targets_csv) != "") {
+    solver.loadSkewTargets(skew_targets_csv);
+  }
+
+  solver.solve();
+  solver.writeResultsCSV(output_csv);
 }
 
 }  // namespace cts

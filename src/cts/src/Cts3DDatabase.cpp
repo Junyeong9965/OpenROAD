@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2019-2025, The OpenROAD Authors
 //
-// JYJ (2026-02-06) Created Cts3DDatabase implementation.
+// Created Cts3DDatabase implementation.
 // Centralizes all 3D tier logic previously scattered across HTreeBuilder
 // (mapBufferMasterToTier, getDominantTierFrom*, hasSuffix) and
 // VerilogFFExtractor (master name parsing).
-// JYJ (2026-02-23) V32a: Added setTierBufferPair() and updated getBufferForTier()
+// Added setTierBufferPair() and updated getBufferForTier()
 // to check explicit cross-tech buffer mapping before suffix substitution.
 // Fixes hold timing regression in ASAP7_NG45_3D where "BUF_X4_bottom" ->
 // "BUF_X4_upper" (suffix swap) fails because "BUF_X4_upper" does not exist;
@@ -32,7 +32,7 @@ Cts3DDatabase::Cts3DDatabase(odb::dbDatabase* db, utl::Logger* logger)
 {
 }
 
-// JYJ (2026-02-06) Moved from floorplan_utils.tcl set_tier_from_master_names()
+// Moved from floorplan_utils.tcl set_tier_from_master_names()
 // and HTreeBuilder anonymous namespace. Now done once in C++ at startup.
 void Cts3DDatabase::populate()
 {
@@ -54,7 +54,7 @@ void Cts3DDatabase::populate()
   int upperCount = 0;
   int bottomCount = 0;
 
-  // JYJ (2026-02-20) Debug: count total instances and sample first master name
+  // Debug: count total instances and sample first master name
   int totalInsts = 0;
   std::string firstMasterName = "(none)";
   for (odb::dbInst* inst : block->getInsts()) {
@@ -75,7 +75,7 @@ void Cts3DDatabase::populate()
     const std::string masterName = master->getName();
     int tier = tierFromMasterName(masterName);
 
-    // JYJ (2026-02-20) Fallback: use ODB tier (set by set_tier_from_master_names)
+    // Fallback: use ODB tier (set by set_tier_from_master_names)
     // Only trust getTier()==1 as unambiguous (default z_=0 means bottom OR unset)
     if (tier < 0) {
       const int odb_tier = inst->getTier();
@@ -103,11 +103,11 @@ void Cts3DDatabase::populate()
                 "Cts3DDatabase populated: bottom={}, upper={}, total={}",
                 bottomCount, upperCount, bottomCount + upperCount);
 
-  // JYJ (2026-02-07) Load HB parasitic after tier assignment
+  // Load HB parasitic after tier assignment
   loadHybridBondParasitics();
 }
 
-// JYJ (2026-02-07, updated 2026-03-10) Load hybrid bond parasitic from tech LEF.
+// Load hybrid bond parasitic from tech LEF.
 // R: read from hb_layer RESISTANCE in tech LEF (ohms per cut for CUT layers).
 //    Fallback default 0.02Ω matches Pin3D paper Table 1 (HBT geometry settings).
 // C: tech LEF does not provide capacitance for CUT layers → set to 0.
@@ -178,7 +178,7 @@ int Cts3DDatabase::getInstTier(odb::dbInst* inst) const
   if (it != instTierMap_.end()) {
     return it->second;
   }
-  // JYJ (2026-02-09) No ODB fallback - our 3DDB is the single source of truth
+  // No ODB fallback - our 3DDB is the single source of truth
   // If instance not in map, tier is unknown
   return -1;
 }
@@ -192,7 +192,7 @@ const std::vector<odb::dbInst*>& Cts3DDatabase::getInstancesOnTier(
   return instsPerTier_[tier];
 }
 
-// JYJ (2026-02-06) Moved from HTreeBuilder.cpp mapBufferMasterToTier()
+// Moved from HTreeBuilder.cpp mapBufferMasterToTier()
 // and hasSuffix(). Logic is identical, now centralized here.
 std::string Cts3DDatabase::getBufferForTier(const std::string& baseMaster,
                                             int targetTier) const
@@ -204,7 +204,19 @@ std::string Cts3DDatabase::getBufferForTier(const std::string& baseMaster,
     return baseMaster;
   }
 
-  // JYJ (2026-02-23) V32a: Check explicit cross-tech tier buffer pair first.
+  // CTS_FORCE_SINGLE_TIER_BUF: disable tier swapping, always return
+  // baseMaster (root buffer). Pin3D uses bottom-only buffers at ALL
+  // H-tree levels → no cross-tier clock branches → uniform tree.
+  static int forceSingleTier = -1;
+  if (forceSingleTier < 0) {
+    const char* e = std::getenv("CTS_FORCE_SINGLE_TIER_BUF");
+    forceSingleTier = (e && std::atoi(e) != 0) ? 1 : 0;
+  }
+  if (forceSingleTier) {
+    return baseMaster;
+  }
+
+  // Check explicit cross-tech tier buffer pair first.
   // Required when bottom/upper cell names don't share the same base name
   // (e.g., "BUF_X4_bottom" vs "BUF_X4_upper" which is an ASAP7 wrapper cell,
   // as opposed to the original "BUFx4_ASAP7_75t_R_upper" whose suffix swap
@@ -246,7 +258,7 @@ std::string Cts3DDatabase::getBufferForTier(const std::string& baseMaster,
   return baseMaster;
 }
 
-// JYJ (2026-02-23) V32a: Register explicit bottom/upper buffer name pair.
+// Register explicit bottom/upper buffer name pair.
 // Enables getBufferForTier() to correctly map across heterogeneous tech nodes
 // where cell base names differ (e.g., NG45 "BUF_X4_bottom" <-> ASAP7 "BUF_X4_upper").
 void Cts3DDatabase::setTierBufferPair(const std::string& bottomBuf,
@@ -259,7 +271,7 @@ void Cts3DDatabase::setTierBufferPair(const std::string& bottomBuf,
                 bottomBufName_, upperBufName_);
 }
 
-// JYJ (2026-02-06) Moved from HTreeBuilder::getDominantTierFromInsts()
+// Moved from HTreeBuilder::getDominantTierFromInsts()
 int Cts3DDatabase::getDominantTier(
     const std::vector<ClockInst*>& insts) const
 {
@@ -286,7 +298,7 @@ int Cts3DDatabase::getDominantTier(
   return (tier1 > tier0) ? 1 : 0;
 }
 
-// JYJ (2026-02-06) Moved from HTreeBuilder::getDominantTierFromSinkLocs()
+// Moved from HTreeBuilder::getDominantTierFromSinkLocs()
 int Cts3DDatabase::getDominantTier(
     const std::vector<Point<double>>& locs,
     const std::map<Point<double>, ClockInst*>& locToSink) const
@@ -294,9 +306,23 @@ int Cts3DDatabase::getDominantTier(
   int tier0 = 0;
   int tier1 = 0;
   for (const Point<double>& loc : locs) {
+    // V58 Fix B: epsilon-tolerant lookup for tier vote.
     auto it = locToSink.find(loc);
     if (it == locToSink.end()) {
-      continue;
+      constexpr double eps = 1e-4;
+      auto hint = locToSink.lower_bound(
+          Point<double>(loc.getX() - eps, loc.getY() - eps));
+      for (auto scan = hint; scan != locToSink.end(); ++scan) {
+        if (scan->first.getX() > loc.getX() + eps) break;
+        if (std::abs(scan->first.getX() - loc.getX()) < eps
+            && std::abs(scan->first.getY() - loc.getY()) < eps) {
+          it = scan;
+          break;
+        }
+      }
+      if (it == locToSink.end()) {
+        continue;
+      }
     }
     ClockInst* inst = it->second;
     if (inst == nullptr) {
@@ -322,7 +348,7 @@ int Cts3DDatabase::getDominantTier(
   return (tier1 > tier0) ? 1 : 0;
 }
 
-// JYJ (2026-02-06) Moved from HTreeBuilder::getDominantTierFromClockSinks()
+// Moved from HTreeBuilder::getDominantTierFromClockSinks()
 int Cts3DDatabase::getDominantTierFromClock(const Clock& clock) const
 {
   int tier0 = 0;
@@ -345,13 +371,13 @@ int Cts3DDatabase::getDominantTierFromClock(const Clock& clock) const
   return (tier1 > tier0) ? 1 : 0;
 }
 
-// JYJ (2026-02-07) SSOT: set tier on CTS-internal ClockInst
+// SSOT: set tier on CTS-internal ClockInst
 void Cts3DDatabase::setClockInstTier(ClockInst& inst, int tier)
 {
   inst.setTier(tier);
 }
 
-// JYJ (2026-02-06) New: cross-tier net detection
+// New: cross-tier net detection
 bool Cts3DDatabase::isCrossTierNet(odb::dbNet* net) const
 {
   if (net == nullptr) {
@@ -404,7 +430,7 @@ void Cts3DDatabase::setHbtParasitic(double resistance, double capacitance)
   hbtCap_ = capacitance;
 }
 
-// JYJ (2026-02-07) Convert HB parasitic to equivalent wire distance
+// Convert HB parasitic to equivalent wire distance
 // Two modes: RC delay (default) or R-only (emergency fallback if wire C invalid)
 double Cts3DDatabase::getHbtEquivalentDistance(double wireResPerUnit,
                                                double wireCapPerUnit) const
@@ -454,7 +480,7 @@ void Cts3DDatabase::reportStats() const
 
 // --- Pre-CTS skew targets ---
 
-// JYJ (2026-02-21) Load per-FF arrival targets from Python LP solver output
+// Load per-FF arrival targets from Python LP solver output
 void Cts3DDatabase::loadSkewTargets(const std::string& csv_path)
 {
   skewTargetMap_.clear();

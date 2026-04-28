@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2019-2025, The OpenROAD Authors
 //
-// JYJ (2026-02-23) V32: ClockLatencyEstimator — per-FF physical achievability
+// ClockLatencyEstimator — per-FF physical achievability
 // bounds estimator for the LP-SAFETY pre-CTS skew solver.
 //
 // Implements the professor's "three leaf buffer cases" (bottom-*):

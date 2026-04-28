@@ -72,7 +72,7 @@ class ClockInst
   float getOutputCap() const { return outputCap_; }
   void setIdealOutputCap(float cap) { idealOutputCap_ = cap; }
   float getIdealOutputCap() const { return idealOutputCap_; }
-  // JYJ (2026-02-06) Tier getter/setter for 3D CTS buffer placement
+  // Tier getter/setter for 3D CTS buffer placement
   void setTier(int tier) { tier_ = tier; }
   int getTier() const { return tier_; }
 
@@ -87,7 +87,7 @@ class ClockInst
   double insertionDelay_;  // insertion delay in terms of length, not time
   float outputCap_;        // current load cap seen by this instance
   float idealOutputCap_;   // ideal load cap needed for perfectly balanced tree
-  int tier_ = -1;  // JYJ (2026-02-06) Tier index for 3D CTS (-1 = unknown)
+  int tier_ = -1;  // Tier index for 3D CTS (-1 = unknown)
 };
 
 //-----------------------------------------------------------------------------
@@ -212,7 +212,7 @@ class Clock
                float inputCap)
   {
     sinks_.emplace_back(name, "", CLOCK_SINK, x, y, pinObj, inputCap);
-    // JYJ (2026-02-06) Bug fix: set dbInst so getTier() works for 3D CTS
+    // Bug fix: set dbInst so getTier() works for 3D CTS
     if (pinObj) {
       sinks_.back().setInstObj(pinObj->getInst());
     }
@@ -226,7 +226,7 @@ class Clock
                float insDelay)
   {
     sinks_.emplace_back(name, "", CLOCK_SINK, x, y, pinObj, inputCap, insDelay);
-    // JYJ (2026-02-06) Bug fix: set dbInst so getTier() works for 3D CTS
+    // Bug fix: set dbInst so getTier() works for 3D CTS
     if (pinObj) {
       sinks_.back().setInstObj(pinObj->getInst());
     }

@@ -33,7 +33,7 @@ class Clustering
 
   void getClusters(std::vector<std::vector<unsigned>>& newClusters) const;
 
-  // JYJ (2026-02-26) V40: Set per-sink LP targets and distance weight.
+  // Set per-sink LP targets and distance weight.
   // When beta > 0, calcDist adds target penalty to cluster assignments.
   void setSinkTargets(const std::vector<float>& targets, float beta);
 
@@ -53,7 +53,7 @@ class Clustering
                   float targetDist,
                   std::pair<float, float>& movablePoint);
 
-  // JYJ V40: target-aware distance (non-static, uses targetBeta_ + meanTargets_)
+  // target-aware distance (non-static, uses targetBeta_ + meanTargets_)
   float calcDist(const std::pair<float, float>& loc, size_t clusterIdx,
                  const Sink* sink) const;
   // Pure geometric distance (static, for fixSegment wire normalization)
@@ -67,7 +67,7 @@ class Clustering
   float segment_length_ = 0.0;
   std::optional<std::pair<float, float>> branching_point_;
 
-  // JYJ V40: LP target-aware clustering parameters
+  // LP target-aware clustering parameters
   float targetBeta_{0.0f};          // target penalty weight in distance
   std::vector<float> meanTargets_;  // per-cluster mean target (updated each iter)
 };

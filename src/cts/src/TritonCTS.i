@@ -505,14 +505,40 @@ extract_ff_timing_graph_verilog(const char* verilog_file, const char* output_fil
   getTritonCts()->extractFFGraphFromVerilog(verilog_file, output_file);
 }
 
-// JYJ (2026-02-21) Pre-CTS skew targets for SG-CTS
+// ODB+STA-based FF timing graph extraction.
+// No Verilog file needed — registers discovered from ODB Liberty cells,
+// edges extracted via STA findPathEnds. Handles macro-included designs.
+void
+extract_ff_timing_graph_odb(const char* output_file)
+{
+  getTritonCts()->extractFFGraphFromODB(output_file);
+}
+
+// Exhaustive IO timing edge extraction via STA per-port.
+// Replaces Tcl extract_io_timing_edges_phase1a (worst-N truncation).
+void
+extract_io_timing_edges(const char* verilog_file, const char* output_file)
+{
+  getTritonCts()->extractIOTimingEdges(verilog_file, output_file);
+}
+
+// ODB-based IO timing edge extraction.
+// No Verilog file needed — uses ODB register collection + STA per-port.
+// Handles macro-included designs where Verilog parsing fails.
+void
+extract_io_timing_edges_odb(const char* output_file)
+{
+  getTritonCts()->extractIOTimingEdgesFromODB(output_file);
+}
+
+// Pre-CTS skew targets for SG-CTS
 void
 load_skew_targets(const char* csv_file)
 {
   getTritonCts()->loadSkewTargets(csv_file);
 }
 
-// JYJ (2026-02-23) V32: Estimate per-FF physical achievability bounds.
+// Estimate per-FF physical achievability bounds.
 // Computes HB via delay (t_via = 0.693 * R_HB * C_HB) from tech and writes
 // bounds CSV for the LP-SAFETY pre-CTS skew solver (pre_cts_skew_lp.py).
 // output_csv:  destination path (ff_name,tier,t_min_ns,t_max_ns)
@@ -521,6 +547,53 @@ void
 estimate_leaf_latencies(const char* output_csv, float max_skew_ns)
 {
   getTritonCts()->estimateLeafLatencies(output_csv, max_skew_ns);
+}
+
+// C++ LP solver for skew targeting.
+// Extracts timing graph from STA in-memory, solves LP-TNS with OR-Tools GLOP,
+// stores results in Cts3DDatabase skewTargetMap_ (no CSV round-trip).
+void
+solve_skew_lp(const char* verilog_file,
+              float sigma_local, float sigma_pi,
+              float lambda_reg, float hold_margin,
+              float gamma_wns, float weight_io,
+              int hard_pi_hold, float max_skew)
+{
+  getTritonCts()->solveSkewLp(verilog_file,
+                              sigma_local, sigma_pi,
+                              lambda_reg, hold_margin,
+                              gamma_wns, weight_io,
+                              hard_pi_hold != 0, max_skew);
+}
+
+// Old solve_buffer_sizing_lp(float, float) removed — replaced by V53_FM_BUF version below.
+
+// Update cascaded TAP chain connections in ODB.
+// Re-reads LP targets CSV and reconnects FFs to the correct TAP depth level
+// without rebuilding the tree.
+void
+update_tap_depths(const char* targets_csv)
+{
+  getTritonCts()->updateTapDepths(targets_csv);
+}
+
+// C++ LP-based buffer sizing with Liberty delays.
+// Replaces Python buffer_sizing_lp.py. Outputs sizing decisions CSV.
+void
+solve_buffer_sizing_lp(const char* timing_csv,
+                       const char* output_csv,
+                       const char* skew_targets_csv,
+                       double hold_weight,
+                       double reg_weight,
+                       double skew_weight,
+                       double setup_margin_ps,
+                       double hold_margin_ps)
+{
+  // Set timing CSV path as env var for BufSizingLpSolver to read
+  setenv("BUF_SIZING_TIMING_CSV", timing_csv, 1);
+  getTritonCts()->solveBufferSizingLp(output_csv, skew_targets_csv,
+                                       hold_weight, reg_weight, skew_weight,
+                                       setup_margin_ps, hold_margin_ps);
 }
 
 %} //inline

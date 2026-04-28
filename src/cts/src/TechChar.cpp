@@ -519,6 +519,44 @@ void TechChar::initCharacterization()
     logger_->info(CTS, 49, "Characterization buffer is {}.", bufMasterName);
   }
 
+  // Compute and cache Liberty-based buffer delay for charBuf_.
+  // At this point we already have charBuf_ selected and its Liberty cell validated.
+  // Query delay at load = charBuf_ input cap (cascaded tap scenario).
+  {
+    sta::Cell* cbCell = db_network_->dbToSta(charBuf_);
+    sta::LibertyCell* cbLiberty = db_network_->libertyCell(cbCell);
+    if (cbLiberty) {
+      sta::LibertyPort *cbIn, *cbOut;
+      cbLiberty->bufferPorts(cbIn, cbOut);
+      if (cbIn && cbOut) {
+        charBufInputCap_ = static_cast<double>(cbIn->capacitance());
+        // Query gate delay at load = input cap (cascaded: buf drives next buf)
+        sta::Corner* corner = openSta_->cmdCorner();
+        const sta::DcalcAnalysisPt* dcalc_ap
+            = corner->findDcalcAnalysisPt(sta::MinMax::max());
+        const sta::Pvt* pvt = dcalc_ap->operatingConditions();
+        double maxDelay = 0.0;
+        for (sta::TimingArcSet* arcSet :
+             cbLiberty->timingArcSets(cbIn, cbOut)) {
+          for (sta::TimingArc* arc : arcSet->arcs()) {
+            auto* model = dynamic_cast<sta::GateTimingModel*>(arc->model());
+            if (!model) continue;
+            sta::ArcDelay ad; sta::Slew sl;
+            // Two-pass slew convergence: first with slew=0, then with output slew
+            model->gateDelay(pvt, 0.0, charBufInputCap_, false, ad, sl);
+            model->gateDelay(pvt, sl, charBufInputCap_, false, ad, sl);
+            double d = static_cast<double>(ad);
+            if (d > maxDelay) maxDelay = d;
+          }
+        }
+        charBufDelay_ns_ = maxDelay * 1e9;  // seconds -> nanoseconds
+        logger_->info(CTS, 833,
+            "Liberty charBuf delay: {:.4f}ns at input_cap={:.4f}fF ({})",
+            charBufDelay_ns_, charBufInputCap_ * 1e15, bufMasterName);
+      }
+    }
+  }
+
   odb::dbMaster* sinkMaster
       = db_->findMaster(options_->getSinkBuffer().c_str());
 

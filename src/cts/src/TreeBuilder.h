@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "Clock.h"
-#include "Cts3DDatabase.h"  // JYJ (2026-02-06) Added for 3D tier management
+#include "Cts3DDatabase.h"  // Added for 3D tier management
 #include "CtsOptions.h"
 #include "TechChar.h"
 #include "Util.h"
@@ -79,7 +79,7 @@ class TreeBuilder
   void mergeBlockages();
   void initBlockages();
   void setTechChar(TechChar& techChar) { techChar_ = &techChar; }
-  // JYJ (2026-02-06) Added for 3D tier management via Cts3DDatabase
+  // Added for 3D tier management via Cts3DDatabase
   void setCts3DDatabase(Cts3DDatabase& db3d) { cts3dDb_ = &db3d; }
   Cts3DDatabase* getCts3DDatabase() const { return cts3dDb_; }
   const Clock& getClock() const { return clock_; }
@@ -203,7 +203,7 @@ class TreeBuilder
     }
     return 0.0;
   }
-  // JYJ (2026-02-09) Made virtual to allow HTreeBuilder to add HB penalty
+  // Made virtual to allow HTreeBuilder to add HB penalty
   virtual double computeDist(const Point<double>& x, const Point<double>& y)
   {
     return x.computeDist(y) + getSinkInsertionDelay(x)
@@ -241,7 +241,7 @@ class TreeBuilder
   CtsOptions* options_ = nullptr;
   Clock clock_;
   TechChar* techChar_ = nullptr;
-  Cts3DDatabase* cts3dDb_ = nullptr;  // JYJ (2026-02-06) 3D tier database
+  Cts3DDatabase* cts3dDb_ = nullptr;  // 3D tier database
   TreeBuilder* parent_;
   std::vector<TreeBuilder*> children_;
   // Tree buffer levels. Number of buffers inserted in first leg of the HTree

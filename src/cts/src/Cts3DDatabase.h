@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2019-2025, The OpenROAD Authors
 //
-// JYJ (2026-02-06) Created Cts3DDatabase: centralized 3D tier management
+// Created Cts3DDatabase: centralized 3D tier management
 // for True 3D CTS. Replaces scattered tier logic in HTreeBuilder and
 // VerilogFFExtractor with a single source of truth.
-// JYJ (2026-02-23) V32a: Added explicit tier buffer pair mapping to fix
+// Added explicit tier buffer pair mapping to fix
 // getBufferForTier() fallback when cell names differ across technology nodes
 // (e.g., "BUF_X4_bottom" -> "BUFx4_ASAP7_75t_R_upper" instead of
 // the non-existent "BUF_X4_upper").
@@ -34,7 +34,7 @@ class Cts3DDatabase
   // (__upper -> tier 1, __bottom -> tier 0)
   void populate();
 
-  // JYJ (2026-02-07) Load HB parasitic from tech definition
+  // Load HB parasitic from tech definition
   // Reads hb_layer via R/C values from set_layer_rc -via hb_layer
   void loadHybridBondParasitics();
 
@@ -47,7 +47,7 @@ class Cts3DDatabase
   const std::vector<odb::dbInst*>& getInstancesOnTier(int tier) const;
 
   // --- Buffer master mapping ---
-  // JYJ (2026-02-06) Moved from HTreeBuilder::mapBufferMasterToTier()
+  // Moved from HTreeBuilder::mapBufferMasterToTier()
 
   // Map a buffer master name to tier-specific variant.
   // First checks explicit bottom<->upper pair set via setTierBufferPair(),
@@ -59,7 +59,7 @@ class Cts3DDatabase
   std::string getBufferForTier(const std::string& baseMaster,
                                int targetTier) const;
 
-  // JYJ (2026-02-23) V32a: Register explicit bottom/upper buffer pair.
+  // Register explicit bottom/upper buffer pair.
   // Bypasses suffix-only guessing when cell names differ across tech nodes.
   // Call after populate(), before tree building.
   // e.g. setTierBufferPair("BUF_X4_bottom", "BUF_X4_upper")
@@ -67,7 +67,7 @@ class Cts3DDatabase
                          const std::string& upperBuf);
 
   // --- Dominant tier computation ---
-  // JYJ (2026-02-06) Moved from HTreeBuilder::getDominantTierFrom*()
+  // Moved from HTreeBuilder::getDominantTierFrom*()
 
   // Majority voting over a set of ClockInst pointers
   int getDominantTier(const std::vector<ClockInst*>& insts) const;
@@ -81,7 +81,7 @@ class Cts3DDatabase
   int getDominantTierFromClock(const Clock& clock) const;
 
   // --- ClockInst tier management ---
-  // JYJ (2026-02-07) Set tier on CTS-internal ClockInst through SSOT
+  // Set tier on CTS-internal ClockInst through SSOT
   // (for buffers created during tree building, before writeDataToDb)
   void setClockInstTier(ClockInst& inst, int tier);
 
@@ -91,7 +91,7 @@ class Cts3DDatabase
   bool isCrossTierNet(odb::dbNet* net) const;
 
   // --- Per-tier wire parasitic ---
-  // JYJ (2026-02-06) Extension point for 3D-aware parasitic estimation
+  // Extension point for 3D-aware parasitic estimation
 
   double getResPerDBU(int tier) const;
   double getCapPerDBU(int tier) const;
@@ -103,7 +103,7 @@ class Cts3DDatabase
   double getHbtCapacitance() const { return hbtCap_; }
   void setHbtParasitic(double resistance, double capacitance);
 
-  // JYJ (2026-02-07) Convert HB R×C delay to equivalent wire distance
+  // Convert HB R×C delay to equivalent wire distance
   // For use in clustering: penalize cross-tier pairs by this distance
   // Physics: HB lumped RC vs wire distributed RC (delay ∝ L²)
   // Formula: L = sqrt((R_HB × C_HB) / (r × c))
@@ -112,7 +112,7 @@ class Cts3DDatabase
                                   double wireCapPerUnit) const;
 
   // --- Pre-CTS skew targets (SG-CTS) ---
-  // JYJ (2026-02-21) Load per-FF arrival time targets from LP solver
+  // Load per-FF arrival time targets from LP solver
   void loadSkewTargets(const std::string& csv_path);
   double getSkewTarget(const std::string& ff_name) const;
   double getSkewTarget(odb::dbInst* inst) const;
@@ -120,6 +120,15 @@ class Cts3DDatabase
   int getSkewTargetCount() const
   {
     return static_cast<int>(skewTargetMap_.size());
+  }
+  const std::unordered_map<std::string, double>& getSkewTargetMap() const {
+    return skewTargetMap_;
+  }
+  // Direct in-memory target setting (no CSV)
+  void clearSkewTargets() { skewTargetMap_.clear(); }
+  void setSkewTarget(const std::string& ff_name, double arrival_ns)
+  {
+    skewTargetMap_[ff_name] = arrival_ns;
   }
 
   // --- Statistics ---
@@ -146,7 +155,7 @@ class Cts3DDatabase
   std::array<double, 2> resPerDBU_ = {0.0, 0.0};
   std::array<double, 2> capPerDBU_ = {0.0, 0.0};
 
-  // JYJ (2026-02-23) V32a: Explicit bottom/upper buffer pair for cross-tech mapping.
+  // Explicit bottom/upper buffer pair for cross-tech mapping.
   // Set via setTierBufferPair(); empty strings mean "use suffix fallback only".
   std::string bottomBufName_;
   std::string upperBufName_;

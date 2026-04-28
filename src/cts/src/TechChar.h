@@ -170,9 +170,15 @@ class TechChar
 
   void createFakeEntries(unsigned length, unsigned fakeLength);
 
-  double getResPerDBU() const { return resPerDBU_; }  // JYJ (2026-02-09) Added getter for wire resistance
+  double getResPerDBU() const { return resPerDBU_; }  // Added getter for wire resistance
   double getCapPerDBU() const { return capPerDBU_; }
   utl::Logger* getLogger() { return options_->getLogger(); }
+
+  // Liberty-based buffer delay for cascaded tap.
+  // Cached during initCharacterization() — charBuf_ driving its own input cap.
+  // Returns -1.0 if Liberty query failed during initialization.
+  double getCharBufDelay() const { return charBufDelay_ns_; }
+  double getCharBufInputCap() const { return charBufInputCap_; }
 
  private:
   // SolutionData represents the various different structures of the
@@ -326,6 +332,10 @@ class TechChar
   odb::dbMTerm* charBufOut_ = nullptr;
   double resPerDBU_;  // ohms/dbu
   double capPerDBU_;  // farads/dbu
+  // Cached Liberty-based buffer delay and input cap.
+  // Computed during initCharacterization() when Liberty cell is available.
+  double charBufDelay_ns_ = -1.0;   // max(rise,fall) gate delay at load=inputCap (ns)
+  double charBufInputCap_ = -1.0;   // input pin capacitance (Liberty units, typically pF)
   float charSlewStepSize_ = 0.0;
   float charCapStepSize_ = 0.0;
   std::vector<std::string> masterNames_;

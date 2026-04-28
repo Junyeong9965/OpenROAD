@@ -57,7 +57,7 @@ class SegmentBuilder
   ClockSubNet* drivingSubNet_;
   TreeBuilder* tree_;
   odb::dbDatabase* db_;
-  int targetTier_ = -1;  // JYJ (2026-02-06) Tier for buffer selection in 3D CTS
+  int targetTier_ = -1;  // Tier for buffer selection in 3D CTS
   unsigned numBufferLevels_ = 0;
 };
 
@@ -286,7 +286,7 @@ class HTreeBuilder : public TreeBuilder
                                   unsigned& outputCap,
                                   int& currWl) const;
 
-  // JYJ (2026-02-09) Phase 3: Override computeDist to add HB penalty for cross-tier pairs
+  // Phase 3: Override computeDist to add HB penalty for cross-tier pairs
   double computeDist(const Point<double>& x, const Point<double>& y) override;
 
  private:
@@ -349,6 +349,27 @@ class HTreeBuilder : public TreeBuilder
                          float maxDiameter,
                          unsigned clusterSize,
                          bool secondLevel = false);
+  // TARP clustering
+  void runTarpClustering(
+      const std::vector<std::pair<float, float>>& points,
+      const std::vector<const ClockInst*>& sinkInsts,
+      unsigned hilbertBestGroupSize = 10,
+      float hilbertBestDiameter = 0.0f);
+
+  // Per-tier independent CTS with shared root buffer.
+  // createSharedRoot() creates one root buffer at the center of ALL sinks.
+  // runSingleTierTree() builds each tier's sub-tree (clustering → CKMeans →
+  // wire segments → cascaded TAP) and attaches L1 branches to the shared root.
+  // Member variables (mapLocationToSink_, topLevelSinksClustered_,
+  // topologyForEachLevel_) are cleared before each tier run for state isolation.
+  void createSharedRoot();
+  void runSingleTierTree(int tier);
+  // Filter sinks to a specific tier, populating sinkLocations and sinkInsts
+  void initTopLevelSinksForTier(
+      int tier,
+      std::vector<std::pair<float, float>>& sinkLocations,
+      std::vector<const ClockInst*>& sinkInsts);
+
   void assignSinksToBranches(
       LevelTopology& topology,
       unsigned branchPtIdx1,
@@ -379,7 +400,7 @@ class HTreeBuilder : public TreeBuilder
   std::vector<unsigned> clusterSizes() const { return clusterSizes_; }
   Point<double> resolveLocationCollision(
       const Point<double>& legalCenter) const;
-  // JYJ (2026-02-06) Removed getDominantTierFromInsts, getDominantTierFromSinkLocs,
+  // Removed getDominantTierFromInsts, getDominantTierFromSinkLocs,
   // getDominantTierFromClockSinks - moved to Cts3DDatabase
 
  private:
@@ -387,6 +408,9 @@ class HTreeBuilder : public TreeBuilder
   std::vector<LevelTopology> topologyForEachLevel_;
   std::map<Point<double>, ClockInst*> mapLocationToSink_;
   std::vector<std::pair<float, float>> topLevelSinksClustered_;
+
+  // V58 Fix B: Epsilon-tolerant lookup for mapLocationToSink_.
+  ClockInst* findSinkEps(const Point<double>& loc, double eps = 1e-4) const;
 
   int wireSegmentUnit_ = 0;
   unsigned minInputCap_ = 0;
@@ -398,20 +422,25 @@ class HTreeBuilder : public TreeBuilder
   std::vector<unsigned> clusterDiameters_ = {50, 100, 200};
   std::vector<unsigned> clusterSizes_ = {10, 20, 30};
 
-  // JYJ (2026-02-21) Step 3: Skew-aware clustering penalty weight
-  // β · |target_a - target_b| is added to computeDist() to group FFs
-  // with similar arrival targets into the same cluster.
-  double skewTargetBeta_ = 0.0;
+  // Step 3: skewTargetBeta_ REMOVED .
+  // Was dead code: computeDist() compared candidate branching points
+  // (not in mapLocationToSink_) so find() always failed → beta penalty
+  // never fired. Target-aware clustering is handled by
+  // CTS_CKMEANS_TARGET_BETA (Clustering::targetBeta_) in
+  // refineBranchingPointsWithClustering() — that one works correctly.
 
-  // JYJ (2026-02-21) Step 4: Per-branch delay targets
+  // Step 4: Per-branch delay targets
   // Maps (levelIdx, branchIdx) → mean arrival target for that branch.
   // Used in createClockSubNets() to insert/skip delay buffers.
   std::map<std::pair<int, unsigned>, double> branchDelayTargets_;
   double globalMeanTarget_ = 0.0;
   double delayTargetThreshold_ = 0.0;  // ns, from CTS_DELAY_TARGET_THRESHOLD env
   void computeBranchDelayTargets();
+  // Read grouped delay, relay, GH-tree, CKMeans env vars.
+  // Extracted so per-tier block can call before initSinkRegion().
+  void readSkewDeliveryEnvVars();
 
-  // JYJ (2026-02-23) V31: Useful-skew wire length adjustment
+  // Useful-skew wire length adjustment
   // Instead of a balanced (equal-wire) H-tree, shift each branch point
   // radially from the clock root based on the cluster's mean LP skew target.
   //   shift_um = wireSkewScale_ * (T_cluster - T_global) / wireDelayPerUnit_
@@ -422,7 +451,7 @@ class HTreeBuilder : public TreeBuilder
   double wireSkewScale_    = 0.0;  // disabled by default (backward compatible)
   double wireDelayPerUnit_ = 0.001; // ns/um = 1.0 ps/um (ASAP7 typical CTS layer)
 
-  // JYJ (2026-02-23) V32b: N-buffer chain leaf delay parameters.
+  // N-buffer chain leaf delay parameters.
   // Step 4 inserts N = round(branchMeanTarget / singleBufDelay_) delay buffers
   // in series at each leaf branch, instead of the V32 binary (0 or 1) approach.
   // Driven by absolute LP-TNS target (not relative to globalMean).
@@ -431,7 +460,7 @@ class HTreeBuilder : public TreeBuilder
   double singleBufDelay_   = 0.012;  // ns, from CTS_LEAF_BUF_DELAY_NS
   int    maxLeafDelayBufs_ = 3;      // from CTS_MAX_LEAF_DELAY_BUFS
 
-  // JYJ (2026-02-23) V32c: cluster buffer → mean LP skew target map.
+  // Cluster buffer → mean LP skew target map.
   // preSinkClustering() replaces individual FF positions in mapLocationToSink_
   // with cluster-buffer ClockInsts (clkbuf_leaf_X). These buffer names are NOT
   // in the LP CSV, so getSkewTarget(bufName) always returns 0.
@@ -440,7 +469,7 @@ class HTreeBuilder : public TreeBuilder
   std::unordered_map<ClockInst*, double> clusterBufTarget_;
   double getClockInstTarget(ClockInst* inst) const;
 
-  // JYJ (2026-02-25) V37: Target-aware adaptive sub-clustering parameters.
+  // Target-aware adaptive sub-clustering parameters.
   // After SinkClustering groups FFs spatially, clusters with high LP target
   // spread are split into sub-clusters so that per-leaf N-chain can cover
   // the reduced spread effectively.
@@ -453,18 +482,32 @@ class HTreeBuilder : public TreeBuilder
   double splitThreshold2wayNs_   = 0.020;  // ns
   double splitThreshold3wayNs_   = 0.040;  // ns
 
-  // JYJ (2026-03-01) V48: Tier-aware cluster split.
+  // Tier-aware cluster split.
   // If a leaf cluster has both bottom and upper FFs, split into two sub-clusters
   // so each gets the correct tier buffer (BUF_X4_bottom / BUF_X4_upper).
   // CTS_ENABLE_TIER_SPLIT (default 0): enable/disable
   bool enableTierSplit_ = false;
 
-  // JYJ (2026-02-25) V37: Per-level globalMean for intermediate delay buffers.
+  // Timing-affinity clustering
+  bool enableTarp_ = false;
+  double tarpAlpha_ = 0.7;
+  // Per-tier independent CTS with shared root
+  bool enablePerTierCts_ = false;
+  // Naming prefix for per-tier buffers/nets to avoid name collisions.
+  // Empty string for unified mode or tier 0; "t1_" for tier 1.
+  std::string tierPrefix_;
+  // Shared root buffer/subnet for per-tier CTS (created once, used by both tiers)
+  ClockInst* sharedRootBuffer_ = nullptr;
+  ClockSubNet* sharedRootSubNet_ = nullptr;
+  Point<double> sharedRootLocation_{0.0, 0.0};
+  int sharedRootTier_ = -1;  // Tier of the shared root buffer
+
+  // Per-level globalMean for intermediate delay buffers.
   // computeBranchDelayTargets() now computes targets at ALL levels (not just leaf).
   // perLevelGlobalMean_[levelIdx] = weighted average of branch means at that level.
   std::map<int, double> perLevelGlobalMean_;
 
-  // JYJ (2026-02-26) V39: Per-FF relay buffer parameters.
+  // Per-FF relay buffer parameters.
   // Replace per-BRANCH N-buffer (coverage=10.9%) with per-FF relay chains.
   // Leaf buffer -> [relay_0] -> [relay_1] -> FF  (high-target FFs)
   // Leaf buffer -> FF                            (low/zero-target FFs)
@@ -475,7 +518,7 @@ class HTreeBuilder : public TreeBuilder
   //   CTS_PER_FF_HOLD_GUARD_NS:  min residual hold slack after relay (ns)
   //   CTS_PER_FF_MIN_TARGET_NS:   skip FFs with delta < this (ns)
   //   CTS_TIMING_GRAPH_CSV:       path to ff_timing_graph.csv for hold budgets
-  // JYJ (2026-02-28) V47: Elmore-based x_useful relay positioning.
+  // Elmore-based x_useful relay positioning.
   // Replaces equal interpolation with exact position x_useful:
   //   delta(x) = d_buf - rc * x * (L - x)   [ps, rc = rw[kOhm/um]*cw[fF/um]]
   //   x_useful  = [L - sqrt(L^2 - 4*(d_buf-target)/rc)] / 2  [um]
@@ -485,11 +528,12 @@ class HTreeBuilder : public TreeBuilder
   //   CTS_RELAY_CW_PER_UM:  wire capacitance (fF/um)
   //   CTS_DBU_PER_UM:       database units per micron (default 2000)
   bool   enablePerFfRelay_     = false;
-  double perFfBufDelay_        = 0.015;   // ns (V47: corrected to actual 15ps)
+  double perFfBufDelay_        = 0.012;   // ns (V51: BUFx4 measured intrinsic = 12ps)
+  double adaptiveDepthCostRatio_ = 1.0;   // adaptive depth cost/benefit threshold
   int    perFfMaxRelay_        = 3;
   double perFfHoldGuard_       = 0.020;   // ns
   double perFfMinTarget_       = 0.010;   // ns
-  // V47: Elmore wire RC parameters for x_useful computation
+  // Elmore wire RC parameters for x_useful computation
   double relayRwKOhmPerUm_     = 0.0;    // kOhm/um (0 = Elmore disabled)
   double relayCwFfPerUm_       = 0.0;    // fF/um
   double relayDbuPerUm_        = 2000.0; // DB units per micron
@@ -497,11 +541,11 @@ class HTreeBuilder : public TreeBuilder
   // Per-FF hold budget: ff_name -> min hold slack (ns) as capture FF
   std::unordered_map<std::string, double> perFfHoldBudget_;
   void loadPerFfHoldBudgets(const std::string& timingGraphCsv);
-  // JYJ (2026-02-26) V40: Load IO edge hold budgets (PI→FF hold slack)
+  // Load IO edge hold budgets (PI→FF hold slack)
   // to prevent relay insertion on FFs with tight PI→FF hold.
   void loadIoHoldBudgets(const std::string& ioCsv);
 
-  // JYJ (2026-03-05) V49: Grouped Delay Chain parameters.
+  // Grouped Delay Chain parameters.
   // Instead of per-FF relay (1 chain per FF → many nets → GRT-0183),
   // group FFs within each leaf cluster by quantized LP target delta.
   // Group 0 (delta < min_delta): direct connection to leaf buffer.
@@ -513,21 +557,33 @@ class HTreeBuilder : public TreeBuilder
   int    groupedDelayMaxDepth_     = 3;
   double groupedDelayMinDelta_     = 0.010;  // ns (10ps)
 
-  // JYJ (2026-03-06) V50: Cluster-Uniform Depth mode.
+  // Cluster-Uniform Depth mode.
   // When enabled, all FFs in a leaf cluster share a SINGLE chain depth k_c
   // computed from the cluster median LP target delta.
-  // V49a created up to MAX_DEPTH distinct depth groups per cluster →
+  // Previously created up to MAX_DEPTH distinct depth groups per cluster →
   // 155 extra buffers (62 clusters × ~2.5 avg groups).
-  // V50 creates exactly 1 chain per cluster (depth=k_c or 0) →
+  // Now creates exactly 1 chain per cluster (depth=k_c or 0) →
   // ~62 extra buffers max (1 chain per cluster), reducing buffer count ~60%.
   // Hold safety: k_c capped by min(hold_budget) across all FFs in cluster.
   //   CTS_GROUPED_DELAY_CLUSTER_UNIFORM: 0/1 (default 0; set 1 for V50 mode)
   bool enableClusterUniform_       = false;
 
-  // V39: Env guard for V37 intermediate delay buffers (default off)
+  // GH-Tree Cascaded Delay Tap.
+  // Instead of parallel grouped delay chains per depth group (V49/V50),
+  // build a single cascaded delay line with tap points per depth level:
+  //   leaf -> tap1 -> tap2 -> ... -> tap_maxDepth
+  //             |       |               |
+  //          d1_FFs  d2_FFs         dMax_FFs
+  // Benefits: ~50% fewer buffers and nets vs parallel chains.
+  // Same depth delivery (depth=k FF passes through exactly k buffers).
+  // Requires CTS_ENABLE_GROUPED_DELAY=1 (uses same depth computation).
+  // CTS_ENABLE_GH_TREE=1 selects cascaded tap; =0 selects parallel chains.
+  bool enableGhTree_ = false;
+
+  // Env guard for V37 intermediate delay buffers (default off)
   bool enableMidDelayBufs_ = false;  // CTS_ENABLE_MID_DELAY_BUFS
 
-  // JYJ (2026-02-26) V40: CKMeans target-aware branching weight.
+  // CKMeans target-aware branching weight.
   // When > 0, CKMeans distance includes target penalty so H-tree branching
   // groups FFs with similar LP targets together → better V31 wire shift.
   double ckmeansTargetBeta_ = 0.0;  // CTS_CKMEANS_TARGET_BETA

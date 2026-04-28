@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2019-2025, The OpenROAD Authors
 //
-// JYJ (2026-02-23) V32: ClockLatencyEstimator implementation.
+// ClockLatencyEstimator implementation.
 // See ClockLatencyEstimator.h for design rationale.
 
 #include "ClockLatencyEstimator.h"

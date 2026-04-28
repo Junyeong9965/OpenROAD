@@ -43,7 +43,7 @@ struct Tree;
 namespace cts {
 
 class ClockInst;
-class Cts3DDatabase;  // JYJ (2026-02-06) Forward decl for 3D tier database
+class Cts3DDatabase;  // Forward decl for 3D tier database
 class CtsOptions;
 class TechChar;
 class StaEngine;
@@ -72,14 +72,58 @@ class TritonCTS
   void extractFFGraphFromVerilog(const std::string& verilog_file,
                                   const std::string& output_file);
 
-  // JYJ (2026-02-21) Pre-CTS skew targets for SG-CTS
+  // BUF_MACRO: ODB+STA-based FF timing graph extraction.
+  // Does NOT require Verilog file — discovers registers from ODB Liberty cells,
+  // then extracts FF→FF edges via STA findPathEnds.
+  // Sees through macro blackboxes (Liberty timing models).
+  // Output CSV format identical to extractFFGraphFromVerilog.
+  void extractFFGraphFromODB(const std::string& output_file);
+
+  // Exhaustive IO timing edge extraction.
+  // Uses STA per-port findPathEnds (PI→FF + FF→PO).
+  // verilog_file: for register name mapping (consistency with FF→FF CSV).
+  // output_file: CSV compatible with cts_skew_lp.py parse_io_timing_edges.
+  void extractIOTimingEdges(const std::string& verilog_file,
+                            const std::string& output_file);
+
+  // BUF_MACRO: ODB-based IO timing edge extraction.
+  // No Verilog file needed — uses odb_registers_ from collectRegistersFromODB().
+  // Handles macro-included designs where Verilog parsing fails.
+  // Output CSV format identical to extractIOTimingEdges.
+  void extractIOTimingEdgesFromODB(const std::string& output_file);
+
+  // Pre-CTS skew targets for SG-CTS
   void loadSkewTargets(const std::string& csv_path);
 
-  // JYJ (2026-02-23) V32: Estimate per-FF physical achievability bounds for LP-SAFETY.
+  // C++ LP solver for skew targeting (replaces Python cts_skew_lp.py)
+  // Extracts timing graph from STA in-memory, solves LP-TNS with OR-Tools GLOP,
+  // stores results directly in skewTargetMap_ (no CSV round-trip).
+  void solveSkewLp(const std::string& verilog_file,
+                   float sigma_local, float sigma_pi,
+                   float lambda_reg, float hold_margin,
+                   float gamma_wns, float weight_io,
+                   bool hard_pi_hold, float max_skew);
+
+  // C++ buffer sizing LP (replaces Python buffer_sizing_lp.py)
+  // Old solveBufferSizingLp(float, float) removed — replaced by V53_FM_BUF version below.
+
+  // Estimate per-FF physical achievability bounds for LP-SAFETY.
   // Computes t_via from HBT parasitic and writes bounds CSV for pre_cts_skew_lp.py.
   // output_csv: destination path (ff_name,tier,t_min_ns,t_max_ns)
   // max_skew_ns: per-FF CTS delay budget (default 100ps = 0.1ns)
   void estimateLeafLatencies(const std::string& output_csv, double max_skew_ns);
+
+  // Update cascaded TAP chain connections in ODB.
+  // Re-reads LP targets CSV and reconnects FFs to the correct TAP depth level
+  // without rebuilding the tree. Used for iterative TARP refinement.
+  void updateTapDepths(const char* targets_csv);
+
+  // C++ LP-based buffer sizing with Liberty delays
+  void solveBufferSizingLp(const char* output_csv,
+                           const char* skew_targets_csv,
+                           double hold_weight, double reg_weight,
+                           double skew_weight,
+                           double setup_margin_ps, double hold_margin_ps);
 
   TechChar* getCharacterization() { return techChar_.get(); }
   odb::dbBlock* getBlock() { return db_->getChip()->getBlock(); }
@@ -229,7 +273,7 @@ class TritonCTS
   utl::Logger* logger_ = nullptr;
   CtsOptions* options_ = nullptr;
   std::unique_ptr<TechChar> techChar_;
-  std::unique_ptr<Cts3DDatabase> cts3dDb_;  // JYJ (2026-02-06) 3D tier database
+  std::unique_ptr<Cts3DDatabase> cts3dDb_;  // 3D tier database
   rsz::Resizer* resizer_ = nullptr;
   est::EstimateParasitics* estimate_parasitics_ = nullptr;
   std::vector<std::unique_ptr<TreeBuilder>> builders_;

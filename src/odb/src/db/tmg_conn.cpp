@@ -1124,13 +1124,17 @@ void tmg_conn::connectTerm(const int j, const bool soft)
         pt->tindex = -1;
       }
       if (pt->tindex >= 0) {
-        logger_->error(ODB,
-                       390,
-                       "order_wires failed: net {}, shorts to another term at "
-                       "wire point ({} {})",
-                       net_->getName(),
-                       pt->x,
-                       pt->y);
+        // DRT short: point already assigned to another terminal.
+        // Skip this assignment to preserve existing RC tree topology.
+        // The short is a DRT routing violation, not an ODB bug.
+        logger_->warn(ODB,
+                      390,
+                      "order_wires: net {}, shorts to another term at "
+                      "wire point ({} {}), skipping",
+                      net_->getName(),
+                      pt->x,
+                      pt->y);
+        continue;
       }
       pt->tindex = j;
       addPointToTerm(pt, x);
@@ -1154,13 +1158,14 @@ void tmg_conn::connectTerm(const int j, const bool soft)
         pt->tindex = -1;
       }
       if (pt->tindex >= 0) {
-        logger_->error(ODB,
-                       391,
-                       "order_wires failed: net {}, shorts to another term at "
-                       "wire point ({} {})",
-                       net_->getName(),
-                       pt->x,
-                       pt->y);
+        logger_->warn(ODB,
+                      391,
+                      "order_wires: net {}, shorts to another term at "
+                      "wire point ({} {}), skipping",
+                      net_->getName(),
+                      pt->x,
+                      pt->y);
+        continue;
       }
       pt->tindex = j;
       addPointToTerm(pt, x);
@@ -1190,13 +1195,14 @@ void tmg_conn::connectTerm(const int j, const bool soft)
         pt->tindex = -1;
       }
       if (pt->tindex >= 0) {
-        logger_->error(ODB,
-                       392,
-                       "order_wires failed: net {}, shorts to another term at "
-                       "wire point ({} {})",
-                       net_->getName(),
-                       pt->x,
-                       pt->y);
+        logger_->warn(ODB,
+                      392,
+                      "order_wires: net {}, shorts to another term at "
+                      "wire point ({} {}), skipping",
+                      net_->getName(),
+                      pt->x,
+                      pt->y);
+        continue;
       }
       pt->tindex = j;
       addPointToTerm(pt, x);

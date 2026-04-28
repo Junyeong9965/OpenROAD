@@ -6,6 +6,11 @@ include("openroad")
 # https://github.com/The-OpenROAD-Project/OpenROAD/issues/1186
 find_package(LEMON NAMES LEMON lemon REQUIRED)
 
+# OR-Tools for LP solver (GLOP)
+# Same pattern as gpl/mpl/par modules
+find_package(ortools REQUIRED)
+message(STATUS "CTS: Found OR-Tools: ${ortools_DIR} (version: ${ortools_VERSION})")
+
 add_library(cts_lib
     Clock.cpp
     TreeBuilder.cpp
@@ -17,8 +22,11 @@ add_library(cts_lib
     LatencyBalancer.cpp
     CtsOptions.cpp
     VerilogFFExtractor.cpp
-    Cts3DDatabase.cpp  # JYJ (2026-02-06) Added 3D tier database
-    ClockLatencyEstimator.cpp  # JYJ (2026-02-23) V32: per-FF physical achievability estimator
+    Cts3DDatabase.cpp
+    ClockLatencyEstimator.cpp
+    CtsSkewLpSolver.cpp  
+    BufSizingLpSolver.cpp
+    TarpClustering.cpp   
 )
 
 swig_lib(NAME      cts
@@ -59,6 +67,7 @@ target_link_libraries(cts_lib
     OpenSTA
     stt_lib
     utl_lib
+    ortools::ortools
 )
 
 target_link_libraries(cts

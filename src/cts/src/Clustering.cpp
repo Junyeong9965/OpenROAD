@@ -39,7 +39,7 @@ struct Sink
   const float x, y;
   int cluster_idx{-1};
   const unsigned sink_idx;  // index in sinks_
-  float target{0.0f};       // JYJ V40: LP skew target (ns)
+  float target{0.0f};       // LP skew target (ns)
 };
 
 Clustering::Clustering(const std::vector<std::pair<float, float>>& sinks,
@@ -148,8 +148,8 @@ float Clustering::Kmeans(const unsigned n,
     sink.cluster_idx = -1;
   }
 
-  // JYJ V41-fix BUG#7: Seed per-cluster mean targets from nearest sinks.
-  // V40 used uniform avgT for all clusters → first iteration was target-blind.
+  // Seed per-cluster mean targets from nearest sinks.
+  // Previously used uniform avgT for all clusters → first iteration was target-blind.
   // Now assign each sink to its nearest initial mean (by position), then compute
   // per-cluster mean target from those nearest sinks.
   if (targetBeta_ > 0.0f) {
@@ -249,7 +249,7 @@ float Clustering::Kmeans(const unsigned n,
       }
     }
 
-    // JYJ V40: Update per-cluster mean targets after means recomputation
+    // Update per-cluster mean targets after means recomputation
     if (targetBeta_ > 0.0f) {
       meanTargets_.resize(n, 0.0f);
       for (unsigned i = 0; i < n; ++i) {
@@ -454,7 +454,7 @@ void Clustering::getClusters(
   }
 }
 
-// JYJ (2026-02-26) V40: Set per-sink LP targets for target-aware clustering.
+// Set per-sink LP targets for target-aware clustering.
 void Clustering::setSinkTargets(const std::vector<float>& targets, float beta)
 {
   targetBeta_ = beta;
@@ -463,7 +463,7 @@ void Clustering::setSinkTargets(const std::vector<float>& targets, float beta)
   }
 }
 
-// JYJ V40: Target-aware distance. Adds target penalty when targetBeta_ > 0.
+// Target-aware distance. Adds target penalty when targetBeta_ > 0.
 float Clustering::calcDist(const std::pair<float, float>& loc,
                            size_t clusterIdx,
                            const Sink* sink) const
